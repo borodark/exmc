@@ -369,6 +369,9 @@ defmodule Exmc.NUTS.Sampler do
     {_, rng} = :rand.uniform_s(rng)
     divergences = if result.divergent, do: state.divergences + 1, else: state.divergences
 
+    # Energy = -joint_logp (Hamiltonian)
+    energy = -Nx.to_number(joint_logp_0)
+
     new_state = %{
       q: result.q,
       logp: result.logp,
@@ -380,7 +383,8 @@ defmodule Exmc.NUTS.Sampler do
     step_info = %{
       depth: result.depth,
       n_steps: result.n_steps,
-      divergent: result.divergent
+      divergent: result.divergent,
+      energy: energy
     }
 
     {new_state, accept_stat, step_info}
@@ -398,7 +402,8 @@ defmodule Exmc.NUTS.Sampler do
           tree_depth: step_info.depth,
           n_steps: step_info.n_steps,
           divergent: step_info.divergent,
-          accept_prob: accept_stat
+          accept_prob: accept_stat,
+          energy: step_info.energy
         }
 
         {[state.q | draws], [step_stat | stats_acc], state}
@@ -458,6 +463,77 @@ defmodule Exmc.NUTS.Sampler do
     traces = Enum.map(results, fn {trace, _stats} -> trace end)
     stats = Enum.map(results, fn {_trace, stats} -> stats end)
     {traces, stats}
+  end
+
+  @doc """
+  Stream samples to a receiver process.
+
+  Runs warmup as normal, then sends `{:exmc_sample, i, point_map, step_stat}` to
+  `receiver_pid` after each sampling step. The point map is in constrained space.
+
+  Returns `:ok` when done.
+  """
+  def sample_stream(ir, receiver_pid, init_values \\ %{}, opts \\ []) do
+    compiled = Compiler.compile_for_sampling(ir)
+    stream_from_compiled(compiled, receiver_pid, init_values, opts)
+  end
+
+  defp stream_from_compiled({vag_fn, step_fn, pm, ncp_info}, receiver_pid, init_values, opts) do
+    opts = Keyword.merge(@default_opts, opts)
+    num_warmup = opts[:num_warmup]
+    num_samples = opts[:num_samples]
+    max_tree_depth = opts[:max_tree_depth]
+    target_accept = opts[:target_accept]
+    seed = opts[:seed]
+
+    if pm.size == 0 do
+      send(receiver_pid, {:exmc_done, 0})
+      :ok
+    else
+      rng = :rand.seed_s(:exsss, seed)
+      d = pm.size
+
+      {q, rng} = init_position(pm, init_values, d, rng)
+      {logp, grad} = vag_fn.(q)
+      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: :f64), {d})
+      {epsilon, rng} = find_reasonable_epsilon_with_rng(step_fn, q, logp, grad, inv_mass_diag, rng)
+
+      state = %{
+        q: q,
+        logp: logp,
+        grad: grad,
+        rng: rng,
+        divergences: 0
+      }
+
+      {state, epsilon, inv_mass_diag} =
+        run_warmup(step_fn, state, epsilon, inv_mass_diag, d, num_warmup, max_tree_depth, target_accept)
+
+      # Sampling phase: send each sample to receiver
+      Enum.reduce(1..num_samples, state, fn i, state ->
+        {state, accept_stat, step_info} =
+          nuts_step_with_stats(step_fn, state, epsilon, inv_mass_diag, max_tree_depth)
+
+        # Build constrained point map for this step
+        unconstrained = PointMap.unpack(state.q, pm)
+        constrained = PointMap.to_constrained(unconstrained, pm)
+        point_map = reconstruct_ncp(constrained, ncp_info)
+
+        step_stat = %{
+          tree_depth: step_info.depth,
+          n_steps: step_info.n_steps,
+          divergent: step_info.divergent,
+          accept_prob: accept_stat,
+          energy: step_info.energy
+        }
+
+        send(receiver_pid, {:exmc_sample, i, point_map, step_stat})
+        state
+      end)
+
+      send(receiver_pid, {:exmc_done, num_samples})
+      :ok
+    end
   end
 
   # --- Trace building ---

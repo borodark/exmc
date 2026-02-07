@@ -21,3 +21,4 @@ exmc-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/
+deps/exla/cache/*
