@@ -1,16 +1,31 @@
 # Exmc
 
-**Probabilistic programming for the BEAM.** A from-scratch Elixir implementation of PyMC's architecture: declarative model specification, automatic constraint transforms, NUTS sampling, and Bayesian diagnostics -- all running on Nx tensors with optional EXLA acceleration.
+**A new PPL environment on the BEAM, inspired by PyMC.** Exmc is a from-scratch Elixir implementation of PyMC’s architecture: declarative model specification, automatic constraint transforms, NUTS sampling, and Bayesian diagnostics — all on Nx tensors with optional EXLA acceleration.
+
+**With deep respect:** this project builds on the ideas, rigor, and ergonomics pioneered by the PyMC community. The goal is not to replace PyMC. The goal is to preserve correctness and usability while exploring what changes when the runtime is the BEAM.
 
 ![Live Streaming Dashboard](assets/live_streaming.png)
 
-## Why Elixir?
+## Why A New PPL Environment?
 
-PyMC is brilliant. It is also a Python library, which means it inherits Python's concurrency story: none. Running four MCMC chains means four OS processes, four copies of the model in memory, four separate GIL-bound interpreters.
+PyMC established a high bar for statistical correctness, extensibility, and user experience. Exmc asks a focused question:
 
-Exmc runs on the BEAM. Four chains are four lightweight processes sharing one compiled model. `Task.async_stream` dispatches them across all cores with zero serialization overhead. The Erlang `:rand` module provides microsecond PRNG with explicit state threading -- no process dictionary, no global mutation, fully deterministic given a seed.
+**What happens if that architecture runs on a fault-tolerant, massively concurrent runtime?**
 
-The result: a probabilistic programming framework where concurrency is not bolted on but falls naturally out of the runtime.
+The BEAM gives us lightweight processes, isolation, and message passing. That changes how we think about multi-chain sampling, streaming diagnostics, and observability. Exmc keeps PyMC’s model semantics and diagnostics philosophy, while rethinking execution.
+
+## What We Preserve From PyMC
+
+- Model semantics and ergonomics: declarative RVs, clear constraints, sensible defaults.
+- Statistical correctness: NUTS with Stan-style warmup, ESS/R-hat, WAIC/LOO.
+- Composable diagnostics: traces, energy, autocorrelation, and predictive checks.
+
+## What The BEAM Enables
+
+- True multi-chain concurrency with one compiled model.
+- Live streaming diagnostics without polling.
+- A live posterior state that can be updated online during sampling.
+- Isolated failure domains so one chain can fail without killing the run.
 
 ## Architecture
 
@@ -88,42 +103,35 @@ Nx.mean(trace["mu"]) |> Nx.to_number()
 
 ## Key Features
 
-**Automatic Non-Centered Parameterization.** Hierarchical Normals where both `mu` and `sigma` are string references are automatically rewritten to `z ~ N(0,1)` with `x = mu + sigma * z`. Eliminates funnel geometry without user intervention.
+- Automatic Non-Centered Parameterization for hierarchical Normals.
+- EXLA auto-detection for `value_and_grad` JIT compilation.
+- Vectorized observations via `Nx.tensor([...])`.
+- Model comparison with WAIC and LOO-CV.
+- Prior and posterior predictive sampling.
 
-**EXLA Auto-Detection.** When EXLA is available, `value_and_grad` is JIT-compiled and the entire leapfrog step is fused into a single XLA computation. Falls back to BinaryBackend transparently.
+## Suggested Screenshots (Placeholders)
 
-**Vectorized Observations.** Pass `Nx.tensor([...])` to `Builder.obs` -- reduction is handled automatically. No need to create one RV+obs pair per data point.
+Add these images once captured:
 
-**Model Comparison.** WAIC and LOO-CV via `Exmc.ModelComparison.compare([{model_a, trace_a}, {model_b, trace_b}])`.
+- `assets/architecture.png` — IR → Rewrite → Compile → NUTS diagram.
+- `assets/live_streaming.png` — live dashboard during sampling.
+- `assets/pair_plot_4k.png` — pair plot with correlations.
+- `assets/energy_plot.png` — energy marginal + transition plot.
 
-**Prior & Posterior Predictive.** `Exmc.Predictive.prior_samples(ir, 500)` and `posterior_predictive(ir, trace)` for model checking.
+## Architectural Decisions
 
-## Test Suite
-
-123 tests (11 doctests + 112 tests), including 25 integration tests covering:
-
-- Conjugate posteriors (Normal-Normal, Gamma-Exponential)
-- Hierarchical models up to 5 free parameters
-- All 9 constrained distributions
-- Non-centered parameterization
-- WAIC/LOO model comparison
-- Vectorized observations
-- Parallel multi-chain sampling
-
-## 35 Architectural Decisions
-
-Every non-trivial choice is recorded in [`DECISIONS.md`](DECISIONS.md) with rationale, assumptions, and implications. From "why `:rand` instead of `Nx.Random`" (D16: 1000x faster on BinaryBackend) to "why auto-NCP" (D32: eliminates funnel geometry) to "why compile once for parallel chains" (D35: no redundant JIT compilation).
+Every non-trivial choice is recorded in `exmc/DECISIONS.md` with rationale, assumptions, and implications.
 
 ## Companion: ExmcViz
 
-See [`../exmc_viz/`](../exmc_viz/) for native ArviZ-style diagnostics -- trace plots, histograms, ACF, pair plots, forest plots, energy diagnostics, and live streaming visualization during sampling.
+See `exmc_viz/` for native ArviZ-style diagnostics — trace plots, histograms, ACF, pair plots, forest plots, energy diagnostics, and live streaming visualization during sampling.
 
 ![Pair Plot](assets/pair_plot_4k.png)
 
 ## License
 
-Exmc is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
+Exmc is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 
 You are free to use, modify, and distribute this software under AGPL terms. If you run a modified version as a network service, you must make your source code available to users of that service.
 
-**Commercial licensing** is available for organizations that need to embed Exmc in proprietary products without AGPL obligations. Contact us for terms.
+Commercial licensing is available for organizations that need to embed Exmc in proprietary products without AGPL obligations. Contact us for terms.
