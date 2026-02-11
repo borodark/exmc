@@ -85,7 +85,7 @@ To make them work together — 4 remote nodes streaming samples to a live visual
 
 The demo: 4 peer nodes, each independently compiling, warming up, and sampling an 8-parameter hierarchical model. 20,000 samples in 21 seconds. Eight trace plots, histograms, and autocorrelation functions updating live from all four nodes simultaneously.
 
-This composition worked on the first attempt because both features were built on the same primitive: `send(pid, {:exmc_sample, i, point_map, step_stat})`. The streaming protocol doesn't care where the sender is. The distribution protocol doesn't care what the receiver does. They compose because the actor model's message passing is the same mechanism at every scale.
+This composition worked on the first attempt because both features were built on the same primitive: `send(pid, {:exmc_sample, i, point_map, step_stat})`. The streaming protocol doesn't care where the sender is. The distribution protocol doesn't care what the receiver does. They compose because the BEAM process runtime's message passing is the same mechanism at every scale.
 
 No existing PPL can do this. Not because it's technically impossible in Python or C++ — but because their runtimes don't provide location-transparent processes with mailboxes, so every integration point requires explicit plumbing.
 
@@ -117,4 +117,4 @@ Exmc is an existence proof that they can be emergent. A probabilistic programmin
 
 ---
 
-*This is the first in a series about building a probabilistic programming framework on the BEAM virtual machine. The code is at [repo link]. The thesis — "Probabilistic Programming on Actor-Model Runtimes" — covers the full technical story.*
+*This is the first in a series about building a probabilistic programming framework on the BEAM virtual machine. The code is at [repo link]. The thesis — "Probabilistic Programming on BEAM Process Runtimes" — covers the full technical story.*

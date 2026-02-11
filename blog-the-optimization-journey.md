@@ -1,6 +1,6 @@
 # 34x Slower to 1.9x Faster: The Optimization Journey
 
-*This is Part 3 of "What If Probabilistic Programming Were Different?" Part 1 introduced the actor-model thesis. Part 2 showed feature parity and benchmark numbers. This part tells the story of how we got there — and what each step reveals about building a PPL on an interpreted runtime.*
+*This is Part 3 of "What If Probabilistic Programming Were Different?" Part 1 introduced the BEAM process runtime thesis. Part 2 showed feature parity and benchmark numbers. This part tells the story of how we got there — and what each step reveals about building a PPL on an interpreted runtime.*
 
 ---
 
@@ -225,4 +225,4 @@ The BEAM gave us streaming, fault tolerance, and distribution for free. The pric
 
 ---
 
-*The thesis — "Probabilistic Programming on Actor-Model Runtimes" — contains the full technical analysis with reproducible benchmarks, cost models, and 52 documented architectural decisions. Parts 1 and 2 of this series cover the architectural thesis and feature parity.*
+*The thesis — "Probabilistic Programming on BEAM Process Runtimes" — contains the full technical analysis with reproducible benchmarks, cost models, and 52 documented architectural decisions. Parts 1 and 2 of this series cover the architectural thesis and feature parity.*

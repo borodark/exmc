@@ -188,4 +188,4 @@ The architectural lesson is broader than any single framework: the properties th
 
 *Part 3 will cover the optimization journey: from 34x slower than PyMC to 1.9x faster, and what each step reveals about the JIT boundary problem in mixed-runtime systems.*
 
-*Exmc is open source. The thesis — "Probabilistic Programming on Actor-Model Runtimes" — covers the full technical story.*
+*Exmc is open source. The thesis — "Probabilistic Programming on BEAM Process Runtimes" — covers the full technical story.*

@@ -1,11 +1,11 @@
-# Probabilistic Programming on Actor-Model Runtimes
+# Probabilistic Programming on BEAM Process Runtimes
 ## Exploiting Fault Tolerance, Distribution, and Liveness for Bayesian Inference
 
 ---
 
 ## Abstract
 
-We present Exmc, a probabilistic programming framework implemented in Elixir on the BEAM virtual machine. While existing PPLs (PyMC, Stan, NumPyro, Turing.jl) treat sampling as a batch computation on a single node, the actor-model runtime provides three properties absent from current systems: (1) fault-tolerant sampling via supervisor hierarchies, (2) live/streaming inference integrated with production web services, and (3) distributed MCMC across Erlang nodes with zero external infrastructure. We provide a systematic analysis of the PPL design space through 52 documented architectural decisions, quantify the performance implications of JIT boundary placement in mixed-runtime PPLs, and demonstrate that BEAM-specific properties enable fundamentally new inference workflows. On a 7-model benchmark suite spanning d=2 to d=102 — including the canonical Eight Schools, Neal's Funnel, Logistic Regression, and Stochastic Volatility benchmarks — Exmc wins 4 models to PyMC's 3: exceeding PyMC by 2.55x on Eight Schools (d=10), 1.65x on the medium hierarchical model (d=5), 1.25x on the stress model (d=8), and 1.20x on Stochastic Volatility (d=102). PyMC wins on throughput-bound models (simple 0.81x, logistic 0.21x) and pathological geometry (funnel 0.40x). With distributed sampling across 4 :peer nodes, Exmc achieves 3.4–3.7x near-linear scaling, demonstrating that BEAM distribution primitives provide true OS-process parallelism for MCMC without external infrastructure.
+We present Exmc, a probabilistic programming framework implemented in Elixir on the BEAM virtual machine. Existing PPLs (PyMC, Stan, NumPyro, Turing.jl) primarily optimize for batch sampling on a single node; BEAM process runtimes expose different systems primitives: (1) fault-tolerant sampling via supervisor hierarchies, (2) live/streaming inference integrated with web services, and (3) distributed MCMC across Erlang nodes using built-in distribution mechanisms. We provide a systematic analysis of the PPL design space through 52 documented architectural decisions, quantify the performance implications of JIT boundary placement in mixed-runtime PPLs, and evaluate BEAM-specific inference workflows. On a 7-model benchmark suite spanning d=2 to d=102 — including Eight Schools, Neal's Funnel, Logistic Regression, and Stochastic Volatility — Exmc wins 4 models to PyMC's 3 in our same-host evaluation: exceeding PyMC by 2.55x on Eight Schools (d=10), 1.65x on the medium hierarchical model (d=5), 1.25x on the stress model (d=8), and 1.20x on Stochastic Volatility (d=102). PyMC wins on throughput-bound models (simple 0.81x, logistic 0.21x) and pathological geometry (funnel 0.40x). With distributed sampling across 4 `:peer` nodes on a same-host setup, Exmc achieves 3.4–3.7x near-linear scaling.
 
 ---
 
@@ -13,17 +13,19 @@ We present Exmc, a probabilistic programming framework implemented in Elixir on 
 
 Probabilistic programming languages (PPLs) enable scientists and engineers to specify Bayesian models declaratively and obtain posterior distributions via automated inference. Over the past decade, systems such as Stan (Carpenter et al., 2017), PyMC (Salvatier et al., 2016), NumPyro (Phan et al., 2019), Turing.jl (Ge et al., 2018), and Pyro (Bingham et al., 2019) have made Bayesian inference accessible to practitioners across disciplines. Yet all of these systems share a common assumption: sampling is a batch computation executed on a single node, producing a complete trace that is analyzed post-hoc.
 
-This assumption forecloses three properties that would be valuable in both research and production settings. First, **fault tolerance**: MCMC sampling runs are long, numerically fragile, and increasingly reliant on accelerator hardware prone to transient failures. No existing PPL can recover gracefully from a mid-sampling crash without restarting the entire run. Second, **liveness**: interactive data science benefits from observing posterior convergence in real time, yet batch PPLs force a "run and wait" workflow where the user sees nothing until sampling completes. Third, **distribution**: scaling Bayesian inference to multiple machines requires external infrastructure (MPI, Dask, Ray) layered atop PPLs that were designed for single-node execution.
+This assumption forecloses three properties that would be valuable in both research and production settings. First, **fault tolerance**: MCMC sampling runs are long, numerically fragile, and increasingly reliant on accelerator hardware prone to transient failures. In mainstream PPL workflows, mid-sampling crashes generally terminate the run and require restart. Second, **liveness**: interactive data science benefits from observing posterior convergence in real time, yet batch PPLs force a "run and wait" workflow where the user sees nothing until sampling completes. Third, **distribution**: scaling Bayesian inference to multiple machines often relies on external infrastructure (MPI, Dask, Ray) layered atop PPLs designed around single-node assumptions.
 
-The BEAM virtual machine — the runtime underlying Erlang and Elixir — provides all three properties as language-level primitives rather than library additions. Lightweight processes with isolated heaps enable fault containment. Asynchronous message passing enables streaming data flows. Built-in node distribution enables multi-machine communication with no external dependencies. These properties arise from the actor-model concurrency paradigm that the BEAM implements.
+The BEAM virtual machine — the runtime underlying Erlang and Elixir — provides all three properties as language-level primitives rather than library additions. Lightweight processes with isolated heaps enable fault containment. Asynchronous message passing enables streaming data flows. Built-in node distribution enables multi-machine communication with no external dependencies. These properties arise from the BEAM process runtime concurrency model.
 
-**Thesis claims.** We argue that building a PPL on an actor-model runtime yields properties absent from all existing systems:
+**Thesis claims.** We argue that building a PPL on a BEAM process runtime yields a distinct and practically useful combination of properties:
+
+Terminology note: where other literature says "actor-model," this thesis uses BEAM-native language - fewer "actors on stage," more supervised processes in production.
 
 1. **Fault tolerance.** BEAM supervisor hierarchies and zero-cost `try/rescue` enable crash recovery *within* NUTS tree building. A subtree that encounters a numerical failure, EXLA error, or memory fault is replaced with a divergent placeholder, and sampling continues — with zero overhead on the non-faulting path.
 
 2. **Liveness.** Message-passing enables streaming inference integrated with production web services. A LiveView process can serve as the sample receiver, delivering posterior updates to a browser in real time with no intermediate infrastructure.
 
-3. **Distribution.** Erlang's `:erpc` module enables multi-node MCMC where model IR (plain Elixir data) is distributed to remote nodes, each compiling and sampling independently. Node failure is recovered transparently. The entire distributed system requires zero external infrastructure.
+3. **Distribution.** Erlang's `:erpc` module enables multi-node MCMC where model IR (plain Elixir data) is distributed to remote nodes, each compiling and sampling independently. Node failure is recovered transparently. The distributed implementation uses runtime-native infrastructure rather than external orchestrators.
 
 We additionally claim that **JIT boundary placement** is a first-class design concern in mixed-runtime PPLs, quantifiable via affine cost models. In a system where JIT-compiled gradient evaluation coexists with an interpreted tree builder, the placement of the boundary between these regimes determines performance. We provide the first systematic cost model for this boundary, demonstrating a three-category operation taxonomy and concrete crossover dimensions.
 
@@ -32,11 +34,13 @@ We additionally claim that **JIT boundary placement** is a first-class design co
 1. The design and implementation of Exmc, a probabilistic programming framework in Elixir with NUTS, ADVI, SMC, and Pathfinder inference, documented through 52 architectural decisions with falsifiable assumptions.
 2. A supervised tree-building mechanism that provides four layers of fault tolerance — from IEEE 754 special value detection through process-level crash recovery — with zero overhead on the non-faulting path (Chapter 3).
 3. A streaming inference protocol (`sample_stream`) that integrates naturally with BEAM processes, demonstrated via real-time browser-based posterior visualization through Phoenix LiveView (Chapter 4).
-4. Distributed MCMC via Erlang node primitives with transparent fault recovery, requiring 203 lines and zero external infrastructure. A 7-model distributed benchmark demonstrates avg 2.87x scaling from 5 `:peer` nodes, with Exmc distributed beating PyMC 4-chain on medium (1.24x) and funnel (1.32x). The closure barrier — Custom distributions capturing tensor graph fragments — is identified as the distribution boundary; fault recovery provides 2.5-2.8x local concurrency as automatic fallback. The streaming and distributed features compose without integration effort — 4 remote nodes stream samples to a live visualization via the same message-passing primitive, demonstrating the actor model's compositional advantage (Chapters 4–5).
+4. Distributed MCMC via Erlang node primitives with transparent fault recovery, requiring 203 lines in the current implementation. A 7-model distributed benchmark demonstrates avg 2.88x scaling from 5 same-host `:peer` nodes, with Exmc distributed beating PyMC 4-chain on medium (1.24x) and funnel (1.32x). The closure barrier — Custom distributions capturing tensor graph fragments — is identified as the distribution boundary; fault recovery provides 2.67-2.76x local concurrency as automatic fallback. The streaming and distributed features compose with minimal integration code: 4 remote nodes stream samples to a live visualization via the same message-passing primitive (Chapters 4–5).
 5. A quantitative analysis of JIT boundary placement in mixed-runtime PPLs, including an affine cost model, a three-category operation taxonomy, and a gap decomposition methodology separating architectural overhead from algorithmic quality (Chapter 6).
-6. Empirical demonstration that a BEAM-hosted PPL can *exceed* PyMC's sampling efficiency on a 7-model benchmark suite spanning d=2 to d=102, including 4 canonical PPL benchmarks (Eight Schools, Neal's Funnel, Logistic Regression, Stochastic Volatility). Exmc wins 4 models to PyMC's 3, with the adaptation-vs-throughput tradeoff as the determining factor: Exmc wins on hard-geometry models (medium 1.65x, stress 1.25x, Eight Schools 2.55x, SV 1.20x) while PyMC wins on easy-geometry models (simple 0.81x, logistic 0.21x) and pathological geometry (funnel 0.40x). The performance gap was reduced from 34x through parameterization choice, batched JIT computation, targeted FFI boundary placement, multinomial sampling correctness fixes, and algorithm-level improvements including the generalized U-turn criterion (Chapter 6). With distributed 4-node sampling, Exmc achieves 3.4–3.7x near-linear scaling via `:peer` nodes (Chapter 5).
+6. Empirical demonstration that a BEAM-hosted PPL can match or exceed PyMC on parts of a 7-model benchmark suite spanning d=2 to d=102, including 4 canonical PPL benchmarks (Eight Schools, Neal's Funnel, Logistic Regression, Stochastic Volatility). In our evaluation, Exmc wins 4 models to PyMC's 3, with the adaptation-vs-throughput tradeoff as the determining factor: Exmc wins on hard-geometry models (medium 1.65x, stress 1.25x, Eight Schools 2.55x, SV 1.20x) while PyMC wins on easy-geometry models (simple 0.81x, logistic 0.21x) and pathological geometry (funnel 0.40x). The performance gap was reduced from 34x through parameterization choice, batched JIT computation, targeted FFI boundary placement, multinomial sampling correctness fixes, and algorithm-level improvements including the generalized U-turn criterion (Chapter 6). With distributed 4-node same-host sampling, Exmc achieves 3.4–3.7x near-linear scaling via `:peer` nodes (Chapter 5).
 
 **Chapter overview.** Chapter 1 surveys the PPL design space and positions Exmc within it. Chapter 2 describes the system architecture, compilation pipeline, and key design insights. Chapter 3 demonstrates fault-tolerant sampling via BEAM supervisors. Chapter 4 presents live and streaming inference workflows. Chapter 5 extends sampling to multiple Erlang nodes. Chapter 6 provides a systematic performance analysis of JIT boundaries in mixed-runtime PPLs, including GPU acceleration. Chapter 7 concludes with contributions, limitations, and future work.
+
+**Evaluation protocol and scope.** Unless explicitly stated otherwise, performance comparisons in this thesis use matched warmup/sample budgets and are run on the same host. Distributed results reported with `:peer` are same-host multi-process experiments, not cross-machine cluster measurements. Reported speedup ratios should therefore be interpreted as controlled implementation comparisons under this setup, not as universal performance rankings across all hardware and workloads.
 
 ---
 
@@ -59,9 +63,9 @@ These systems share a common runtime model: sampling is a batch computation on a
 | Pyro | Python | PyTorch | SVI, MCMC | Dynamic | GPU-first, heavy framework |
 | **Exmc** | **Elixir** | **Nx/EXLA** | **NUTS, ADVI, SMC** | **Dynamic** | **Per-leapfrog overhead (1ms vs 0.1ms)** |
 
-### 1.2 The Actor-Model Runtime
+### 1.2 The BEAM Process Runtime
 
-The BEAM virtual machine (Virding et al., 1996; Armstrong, 2003) implements the actor-model concurrency paradigm. Processes are lightweight (2KB initial heap), isolated (no shared memory), and communicate exclusively via asynchronous message passing. The runtime provides three properties relevant to probabilistic programming:
+The BEAM virtual machine (Virding et al., 1996; Armstrong, 2003) implements a process-isolated, message-passing concurrency paradigm. Processes are lightweight (2KB initial heap), isolated (no shared memory), and communicate exclusively via asynchronous message passing. The runtime provides three properties relevant to probabilistic programming:
 
 **Fault isolation.** Each process has an independent heap. A crash — whether from arithmetic error, memory exhaustion, or external dependency failure — destroys only the faulting process. Supervisor processes monitor workers and implement configurable restart strategies. The `try/rescue` mechanism registers an exception handler on the process stack with zero runtime cost on the non-faulting path.
 
@@ -75,11 +79,11 @@ The "let it crash" philosophy (Armstrong, 2003) inverts the traditional approach
 
 This thesis addresses four research questions, each answered by a specific chapter:
 
-1. **Can actor-model fault isolation provide zero-cost crash recovery within MCMC tree building?** (Chapter 3) We demonstrate that BEAM's `try/rescue` wraps NUTS subtree computation with zero overhead on the non-faulting path, enabling recovery from numerical crashes, EXLA failures, and memory faults without restarting the sampling run.
+1. **Can BEAM process runtime fault isolation provide zero-cost crash recovery within MCMC tree building?** (Chapter 3) We demonstrate that BEAM's `try/rescue` wraps NUTS subtree computation with zero overhead on the non-faulting path, enabling recovery from numerical crashes, EXLA failures, and memory faults without restarting the sampling run.
 
 2. **Does message-passing concurrency enable live inference integrated with production web services?** (Chapter 4) We show that Elixir's process mailboxes provide a natural streaming protocol for MCMC samples, demonstrated via real-time browser-based posterior visualization through Phoenix LiveView.
 
-3. **Can Erlang distribution primitives support multi-node MCMC with transparent fault recovery?** (Chapter 5) We implement distributed chain dispatch via `:erpc` with automatic retry on node failure, requiring 203 lines and zero external infrastructure.
+3. **Can Erlang distribution primitives support multi-node MCMC with transparent fault recovery?** (Chapter 5) We implement distributed chain dispatch via `:erpc` with automatic retry on node failure, requiring 203 lines and runtime-native infrastructure.
 
 4. **How should JIT boundaries be placed in a mixed-runtime PPL, and what is the quantitative cost of misplacement?** (Chapter 6) We develop an affine cost model for JIT boundary operations, identify concrete crossover dimensions, and decompose the performance gap between Exmc and PyMC into architectural and algorithmic components.
 
@@ -179,7 +183,7 @@ Adaptation overhead is less than 1% of total sampling time. The "two-language pr
 
 MCMC sampling runs are long-running numerical computations where failures are not exceptional — they are expected. Gradients diverge when the sampler explores regions of extreme curvature. GPU kernels fail under memory pressure. EXLA compilations crash on pathological input shapes. In every existing PPL, such failures abort the entire sampling run, discarding all progress. The user restarts from scratch, perhaps with different initial values, hoping the failure does not recur.
 
-The actor model offers a different approach. If each subtree computation is isolated in its own fault boundary, a crash destroys only the faulting subtree. The rest of the trajectory — and the entire sampling run — continues. This chapter demonstrates that BEAM's process isolation and `try/rescue` mechanism provide this fault boundary at zero cost on the non-faulting path, and that the existing NUTS tree structure naturally accommodates failed subtrees via divergent placeholders.
+The BEAM process runtime offers a different approach. If each subtree computation is isolated in its own fault boundary, a crash destroys only the faulting subtree. The rest of the trajectory — and the entire sampling run — continues. This chapter demonstrates that BEAM's process isolation and `try/rescue` mechanism provide this fault boundary at zero cost on the non-faulting path, and that the existing NUTS tree structure naturally accommodates failed subtrees via divergent placeholders.
 
 ### 3.1 Current Fault Handling
 
@@ -221,7 +225,7 @@ Empirical evaluation confirms the mechanism's properties:
 
 The mechanism is validated by 15 tests covering fault injection, tree-level recovery, no-failure parity, end-to-end recovery with valid posteriors, recovery statistics tracking, task timeout, and overhead benchmarking. A process-dictionary-based FaultInjector utility (66 lines) enables reproducible fault tolerance testing without modifying production code paths.
 
-No existing PPL treats MCMC subtree failures as recoverable events. In PyMC, a hard crash (segfault in the C sampler, CUDA OOM) aborts the entire sampling run; divergences are counted post-hoc as warnings. In Stan, C++ exceptions propagate to the top level, and `try/catch` has measurable overhead (~1–2ns per frame) due to exception table registration. In NumPyro, JAX's JIT compilation means the entire tree is one XLA kernel — no fault boundary is possible within it. In Turing.jl, Julia exceptions propagate normally with no per-subtree recovery mechanism.
+To our knowledge, mainstream PPL implementations do not treat MCMC subtree failures as recoverable events in the same way. In PyMC, a hard crash (segfault in the C sampler, CUDA OOM) aborts the sampling run; divergences are counted post-hoc as warnings. In Stan, C++ exceptions propagate to the top level. In NumPyro, JAX's JIT compilation places the tree inside one XLA kernel, which limits intra-tree fault boundaries. In Turing.jl, Julia exceptions propagate normally without a built-in per-subtree recovery path.
 
 BEAM's `try/rescue` is the only mechanism among these runtimes where fault containment is free on the happy path. Combined with the three-layer NaN/divergence handling (Section 3.1), Exmc provides four layers of fault tolerance — from IEEE 754 special value detection up through process-level crash recovery.
 
@@ -236,7 +240,7 @@ Both levels share the same design principle: replace the failed computation with
 - Subtrees are independent within a tree (no shared state to corrupt)
 - Chains are independent within a multi-chain run (functional PRNG, immutable tensors)
 
-This two-level hierarchy is unique to BEAM-based PPLs and arises naturally from the actor model's fault isolation semantics.
+This two-level hierarchy is unique to BEAM-based PPLs and arises naturally from BEAM process runtime fault-isolation semantics.
 
 ---
 
@@ -244,7 +248,7 @@ This two-level hierarchy is unique to BEAM-based PPLs and arises naturally from 
 
 Interactive data science benefits from real-time feedback during model fitting. A practitioner running a hierarchical model wants to see whether chains are mixing, whether the posterior is converging, and whether the model is behaving as expected — not wait minutes for a batch run to complete before discovering a problem. Yet every existing PPL enforces a "run and wait" workflow: `pm.sample()` returns a complete trace or nothing.
 
-The actor model provides a natural alternative. If the sampler is a process and each sample is a message, then any other process — a visualization, a web handler, a monitoring system — can receive posterior updates as they are produced. No polling, no shared memory, no callback that blocks the sampler. This chapter demonstrates that streaming inference emerges naturally from BEAM's message-passing semantics and integrates directly with production web frameworks.
+The BEAM process runtime provides a natural alternative. If the sampler is a process and each sample is a message, then any other process — a visualization, a web handler, a monitoring system — can receive posterior updates as they are produced. No polling, no shared memory, no callback that blocks the sampler. This chapter demonstrates that streaming inference emerges naturally from BEAM's message-passing semantics and integrates directly with production web frameworks.
 
 ### 4.1 sample_stream — Inference as Message Passing
 
@@ -260,7 +264,7 @@ ExmcViz is validated by 64 tests with live rendering verified during sampling.
 
 ### 4.3 Phoenix LiveView — Live Bayesian Inference in the Browser
 
-The claim that actor-model runtimes enable live inference workflows is validated by `exmc_live/`, a Phoenix LiveView application where the LiveView process itself serves as the `receiver_pid` for `sample_stream`. There is no intermediate GenServer, no polling, and no batch completion — the browser sees posterior updates as they happen.
+The claim that BEAM process runtimes enable live inference workflows is validated by `exmc_live/`, a Phoenix LiveView application where the LiveView process itself serves as the `receiver_pid` for `sample_stream`. There is no intermediate GenServer, no polling, and no batch completion — the browser sees posterior updates as they happen.
 
 **Architecture:** User selects a model (3 presets: conjugate 1RV, two-param 2RV, hierarchical 5RV), enters observations, clicks "Sample." The LiveView spawns a Task calling `sample_stream(ir, self(), init, opts)`. Each `{:exmc_sample, i, point_map, step_stat}` message is buffered (5 samples), then pushed to the browser via `push_event("new_samples", payload)`. Chart.js hooks render trace plots and histograms with zero-animation incremental updates (`chart.update("none")`). Running diagnostics (mean, std, ESS) update with each batch. Latency is tracked at 4 points: warmup time, time to first browser update, per-sample latency, total ESS/s.
 
@@ -268,13 +272,13 @@ The claim that actor-model runtimes enable live inference workflows is validated
 
 The implementation consists of a single LiveView module, a Models module, and two JavaScript hooks. It supports three preset models (1, 2, and 5 free random variables), and conjugate model posteriors match analytic solutions within tolerance. All 12 tests pass.
 
-No existing PPL provides comparable web integration. PyMC's `pm.sample(callback=fn)` blocks sampling during the callback, with post-hoc visualization only via ArviZ. Stan has no streaming API; ShinyStan requires a separate R process and updates only between chains. NumPyro returns the full trace after completion. Turing.jl's `AbstractMCMC.step` returns individual samples but has no web framework integration.
+To our knowledge, no mainstream PPL provides the same level of direct web-framework integration for live posterior updates. PyMC's `pm.sample(callback=fn)` blocks sampling during the callback, with post-hoc visualization via ArviZ. Stan has no streaming API; ShinyStan requires a separate R process and updates only between chains. NumPyro returns the full trace after completion. Turing.jl's `AbstractMCMC.step` returns individual samples but has no built-in web framework integration.
 
-The Exmc approach requires zero special infrastructure: `Task.start` + `send(receiver_pid, msg)` + `push_event`. The web framework and the sampler communicate via the same message-passing primitive that drives all BEAM concurrency. Live Bayesian inference — where a user submits data and watches the posterior converge in real time — is a natural consequence of building a PPL on an actor-model runtime. It emerges from the runtime's message-passing semantics rather than requiring separate design.
+The Exmc approach requires zero special infrastructure: `Task.start` + `send(receiver_pid, msg)` + `push_event`. The web framework and the sampler communicate via the same message-passing primitive that drives all BEAM concurrency. Live Bayesian inference — where a user submits data and watches the posterior converge in real time — is a natural consequence of building a PPL on a BEAM process runtime. It emerges from the runtime's message-passing semantics rather than requiring separate design.
 
 ### 4.4 Distributed Live Streaming — Emergent Feature Composition
 
-The strongest evidence for the actor-model thesis is not any single feature but the *composition* of independently-designed features without integration effort. Chapters 4 and 5 present streaming inference and distributed sampling as separate contributions. This section demonstrates that their composition is trivial — and that this triviality is a direct consequence of building both features on the same message-passing primitive.
+The strongest evidence for the BEAM process runtime thesis is not any single feature but the *composition* of independently-designed features without integration effort. Chapters 4 and 5 present streaming inference and distributed sampling as separate contributions. This section demonstrates that their composition is trivial — and that this triviality is a direct consequence of building both features on the same message-passing primitive.
 
 `ExmcViz.stream_external/2` opens a LiveDashboard visualization in external mode: no auto-sampler, just a coordinator PID published via `:persistent_term`. Any process — local or remote — can send `{:exmc_sample, i, point_map, step_stat}` to this PID. The implementation adds 3 lines to LiveDashboard and ~50 lines for the new API. All existing visualization components (trace plots, histograms, ACF, summary panels) required zero changes.
 
@@ -282,9 +286,9 @@ The distributed live streaming demo (`demo/demo_distributed.exs`) composes these
 
 Result: 20,000 samples in 21.1 seconds (948 samples/s), with 8 trace plots, histograms, and ACF updating in real time from all 4 nodes simultaneously. The visualization shows samples arriving interleaved from different chains — chains finish at different times (14.5s to 21.1s) due to independent warmup adaptation finding different step sizes.
 
-The key architectural observation: the streaming protocol (`{:exmc_sample, ...}`) was designed for single-chain ExmcViz months before the distributed system existed. The distributed protocol (`:erpc.call` with `sample_stream`) was designed for batch result collection. Their composition worked on the first attempt because Erlang PIDs are location-transparent — `send(pid, msg)` has identical semantics whether `pid` is on the local node or a remote node. No new protocol, serialization layer, or message broker was needed. This is the actor-model thesis in action: features built on the same concurrency primitive compose without integration effort.
+The key architectural observation: the streaming protocol (`{:exmc_sample, ...}`) was designed for single-chain ExmcViz months before the distributed system existed. The distributed protocol (`:erpc.call` with `sample_stream`) was designed for batch result collection. Their composition worked on the first attempt because Erlang PIDs are location-transparent — `send(pid, msg)` has identical semantics whether `pid` is on the local node or a remote node. No new protocol, serialization layer, or message broker was needed. This is the BEAM process runtime thesis in action: features built on the same concurrency primitive compose without integration effort.
 
-No existing PPL can replicate this. PyMC has no streaming API to compose with distribution. Stan's CmdStan communicates via file I/O. NumPyro returns complete traces. The closest parallel would be combining Turing.jl's `AbstractMCMC.step` with Julia's `Distributed` module, but no such integration exists — it would require explicit serialization of step results across Julia workers and a custom aggregation layer.
+We are not aware of an equivalent composition in mainstream PPL stacks today. PyMC has no streaming API to compose with distribution. Stan's CmdStan communicates via file I/O. NumPyro returns complete traces. The closest parallel would be combining Turing.jl's `AbstractMCMC.step` with Julia's `Distributed` module, which would require explicit serialization and aggregation.
 
 ---
 
@@ -292,7 +296,7 @@ No existing PPL can replicate this. PyMC has no streaming API to compose with di
 
 Modern Bayesian workflows increasingly demand multiple chains — for convergence diagnostics (R-hat), for embarrassingly parallel speedup, and for exploring multi-modal posteriors. Scaling beyond a single machine is desirable when models are expensive or when hardware resources are distributed across a cluster. The distributed MCMC literature offers principled approaches such as consensus Monte Carlo (Neiswanger et al., 2014; Scott et al., 2016) and unbiased coupling methods (Jacob et al., 2020), but existing PPL implementations require substantial infrastructure: PyMC relies on `multiprocessing` with fragile `cloudpickle` serialization; Stan requires MPI for `map_rect`; NumPyro's `pmap` is limited to a single host. None provides fault recovery when a remote worker fails.
 
-Erlang was designed for distributed telecommunications systems where nodes join and leave dynamically and failures are routine. The same primitives — node discovery, remote procedure calls via `:erpc`, and transparent term serialization — apply directly to distributing MCMC chains. This chapter demonstrates that the jump from local to distributed sampling is architecturally straightforward on the BEAM, requiring 203 lines of Elixir and zero external infrastructure.
+Erlang was designed for distributed telecommunications systems where nodes join and leave dynamically and failures are routine. The same primitives — node discovery, remote procedure calls via `:erpc`, and transparent term serialization — apply directly to distributing MCMC chains. This chapter demonstrates that the jump from local to distributed sampling is architecturally straightforward on the BEAM, requiring 203 lines of Elixir and runtime-native infrastructure.
 
 ### 5.1 Parallel Chains via Task.async_stream
 
@@ -319,8 +323,8 @@ All 5 tests pass (3 coordinator-only + 2 multi-node via OTP `:peer` module). Wal
 
 | Configuration | Simple ESS/s | Medium ESS/s | Stress ESS/s |
 |---|---|---|---|
-| Local 4ch (sequential) | 490 | 233 | 169 |
-| Distributed 5 nodes × 1ch | **1665** | **812** | **628** |
+| Local 4-chain (sequential) | 490 | 233 | 169 |
+| Distributed 5 nodes × 1-chain | **1665** | **812** | **628** |
 | Speedup | **3.4x** | **3.5x** | **3.7x** |
 
 Each `:peer` node is a separate OS process with its own BEAM scheduler pool, providing true multi-core parallelism. The coordinator node participates as chain 0, running concurrently with the 4 peer chains (5 total chains). Near-linear scaling (3.4–3.7x from 5 chains) indicates minimal coordination overhead. Wall times: simple 2555ms, medium 4138ms, stress 5275ms.
@@ -337,7 +341,7 @@ By contrast, PyMC uses `cloudpickle` + `multiprocessing.Pool` with fragile seria
 
 The initial 3-model distributed benchmark (Section 5.3) tested only standard distributions. To validate distribution scaling across the full model spectrum — including Custom distributions with closure-captured data — we extended the benchmark to all 7 models, 5 seeds, with comparison against PyMC's 4-chain `multiprocessing`.
 
-| Model | d | Exmc 1ch | Exmc 5-node | Scaling | PyMC 4ch | Dist vs PyMC |
+| Model | d | Exmc 1-chain | Exmc 5-node | Scaling | PyMC 4-chain | Dist vs PyMC |
 |-------|---|---------|------------|---------|---------|-------------|
 | Simple | 2 | 430 | 1,687 | 3.92x | 1,999 | 0.84x |
 | Medium | 5 | 271 | **841** | 3.10x | 680 | **1.24x** |
@@ -345,7 +349,7 @@ The initial 3-model distributed benchmark (Section 5.3) tested only standard dis
 | Eight Schools | 10 | 7.7 | 13.3 | 1.73x | 20.3 | 0.66x |
 | Funnel | 10 | 1.6 | **5.4** | 3.38x | 4.1 | **1.32x** |
 | Logistic | 21 | 63 | 175† | 2.76x | 1,514 | 0.12x |
-| SV | 102 | 0.6 | ~1.5† | ~2.5x | 2.2 | ~0.68x |
+| SV | 102 | 0.6 | 1.6† | 2.67x | 2.2 | 0.73x |
 
 *† Closure barrier — all chains fell back to coordinator (local concurrency only)*
 
@@ -353,9 +357,9 @@ The initial 3-model distributed benchmark (Section 5.3) tested only standard dis
 
 This is a design space boundary, not a bug: **distribution-safe PPL models must separate data from computation** — observed data belongs in the IR (as tensor fields or string refs), not captured in closures. The fix is known: `Builder.obs_data("x_matrix", x_matrix)` would store the tensor as a named IR field, making logistic and SV distribute transparently.
 
-**Distribution amplifies adaptation advantage.** On medium (d=5), Exmc's 1ch advantage (1.65x) is amplified by distribution: 5-node Exmc (841) beats PyMC 4ch (680) by 1.24x. On funnel (d=10), distribution *inverts* the 1ch result: Exmc loses 1ch (0.27x) but wins distributed (1.32x) because 3.38x scaling from 5 `:peer` nodes exceeds PyMC's ~2x from 4 OS processes.
+**Distribution amplifies adaptation advantage.** On medium (d=5), Exmc's 1-chain advantage (1.65x) is amplified by distribution: 5-node Exmc (841) beats PyMC 4-chain (680) by 1.24x. On funnel (d=10), distribution *inverts* the 1-chain result: Exmc loses 1-chain (0.27x) but wins distributed (1.32x) because 3.38x scaling from 5 `:peer` nodes exceeds PyMC's ~2x from 4 OS processes.
 
-**Average scaling: 2.87x from 5 nodes** across all 7 models. Even closure-barrier models achieve 2.5-2.8x from fault-recovery concurrency — the recovery path IS local parallelism.
+**Average scaling: 2.88x from 5 nodes** across all 7 models. Even closure-barrier models achieve 2.5-2.8x from fault-recovery concurrency — the recovery path IS local parallelism.
 
 ---
 
@@ -364,6 +368,7 @@ This is a design space boundary, not a bug: **distribution-safe PPL models must 
 ### 6.1 The JIT Boundary Problem
 
 In a PPL with JIT-compiled gradient computation and an interpreted host-language sampler, tensors that cross the JIT boundary carry their backend. This is analogous to the interpreter/compiler boundary problem in language runtimes (Würthinger et al., 2013), but with a PPL-specific twist: the cost is paid per leapfrog step rather than per function call. EXLA.jit outputs on EXLA.Backend flow into the Elixir tree builder, where every Nx operation dispatches through the EXLA runtime.
+In short: Markov processes should explore posterior geometry; we should explore boundary placement to minimize transition-cost overhead.
 
 ### 6.2 Quantified Overhead
 
@@ -526,7 +531,7 @@ The JIT dispatch overhead (~160us) is the irreducible floor for the interpreted-
 | P3: NIF outer loop | ~2–3x | 0.86x | Failed: double FFI crossing overhead |
 | P3: NIF inner subtree | ~1.5x | **1.5x** | Succeeded: single FFI boundary |
 
-This decomposition methodology — separating architectural overhead from algorithmic quality — appears absent from PPL benchmarking literature. The key finding is that what appeared to be a 2.6x "adaptation quality" gap was actually a parameterization choice problem. With the correct parameterization, the entire remaining gap is architectural. Together with the FFI granularity principle (Section 6.10), these changes reduced the PyMC gap from 34x to 1.5x through purely algorithmic and architectural decisions, with no modification to the core NUTS algorithm.
+This decomposition methodology — separating architectural overhead from algorithmic quality — is, to our knowledge, uncommon in PPL benchmarking literature. The key finding is that what appeared to be a 2.6x "adaptation quality" gap was actually a parameterization choice problem. With the correct parameterization, the entire remaining gap is architectural. Together with the FFI granularity principle (Section 6.10), these changes reduced the PyMC gap from 34x to 1.5x in this benchmark setup through purely algorithmic and architectural decisions, with no modification to the core NUTS algorithm.
 
 ### 6.10 Phase P3: Rust NIF Tree Builder — FFI Boundary Granularity
 
@@ -701,7 +706,7 @@ The rho-based U-turn criterion (Section 6.10.3) improved stress model ESS/s by 3
 
 **Multiplicative interaction.** The two fixes interact: more mass matrix samples (term_buffer) combined with cleaner samples (divergent skip) produce a superlinear improvement. The dependency chain D26 → D45 → D44 demonstrates that warmup parameters form a coupled system: the log_epsilon_bar fix was a *prerequisite* for reducing term_buffer, and the divergent skip amplifies the benefit of additional samples.
 
-**Results (5-seed medians, 1ch CPU).**
+**Results (5-seed medians, 1-chain CPU).**
 
 | Model (d) | Before | After | Change | vs PyMC |
 |-----------|:------:|:-----:|:------:|:-------:|
@@ -709,7 +714,7 @@ The rho-based U-turn criterion (Section 6.10.3) improved stress model ESS/s by 3
 | Medium (5) | 26.5 | 55.3 | +109% | — |
 | Stress (8) | 13.3 | 37.3 | +180% | — |
 
-*(These are 1ch no-NIF baselines. With NIF/speculative paths and multi-chain, absolute numbers are higher.)*
+*(These are 1-chain no-NIF baselines. With NIF/speculative paths and multi-chain, absolute numbers are higher.)*
 
 **Significance for PPL design.** Both fixes are invisible in the published NUTS algorithm (Hoffman and Gelman, 2014) and the HMC tutorial (Betancourt, 2017). They are documented only in Stan's C++ source code comments. A PPL implementor reading only the published literature would miss both optimizations. This represents a concrete instance of the "folklore knowledge" barrier in PPL development: the gap between what is published and what is practiced. For a BEAM-hosted PPL without access to Stan's training data (i.e., years of developer experience encoded in source comments), closing this gap requires systematic A/B benchmarking against mature implementations. The 52 documented decisions (D1-D52) serve as a structured record of this reverse-engineering process.
 
@@ -773,7 +778,7 @@ The difference is significant when the subtree outweighs the existing trajectory
 
 *PyMC baselines updated to live 5-seed race: simple 576, medium 157, stress 185 ESS/s.*
 
-Duplicate sample rate dropped from 37.7% to 6.5% (PyMC: 7.8%). The medium model improvement is the most striking: from 3.3 ESS/s at Phase 0 to 298 ESS/s — a 90x improvement over the entire optimization trajectory, now substantially exceeding PyMC's 157 ESS/s. **Exmc beats PyMC on medium (1.90x) and stress (1.16x) models.** The simple model lags at 0.81x, likely due to per-tree Elixir overhead dominating at shallow tree depths (avg depth ~2).
+Duplicate sample rate dropped from 37.7% to 6.5% (PyMC: 7.8%). The medium model improvement is the most striking: from 3.3 ESS/s at Phase 0 to 298 ESS/s — a 90x improvement over the entire optimization trajectory, exceeding PyMC's 157 ESS/s in this benchmark. **Exmc beats PyMC on medium (1.90x) and stress (1.16x) models in this setup.** The simple model lags at 0.81x, likely due to per-tree Elixir overhead dominating at shallow tree depths (avg depth ~2).
 
 **Significance.** These two bugs are representative of a broader problem in PPL reimplementation: the NUTS algorithm's correctness (in the MCMC validity sense) is robust to many implementation variations — incorrect multinomial weights still produce valid posteriors because the acceptance probability is bounded. But *efficiency* (ESS per sample) is highly sensitive to these implementation details. The distinction between inner and outer merge sampling is documented only in Betancourt (2017, Appendix A.3.2), not in the original NUTS paper (Hoffman and Gelman, 2014). A systematic audit of independent NUTS implementations (Turing.jl, Blackjax, etc.) may reveal that this class of "correctness-preserving efficiency bugs" is widespread.
 
@@ -885,17 +890,17 @@ NumPyro/JAX achieves GPU acceleration naturally because the entire sampler (incl
 
 ### 7.1 Contributions
 
-This thesis has demonstrated that the actor-model runtime provides properties for probabilistic programming that are absent from all existing systems. We summarize the contributions with their supporting evidence.
+This thesis has shown that BEAM process runtime properties can be applied effectively to probabilistic programming. We summarize the contributions with their supporting evidence.
 
 **A probabilistic programming framework on the BEAM.** Exmc implements NUTS, ADVI, SMC, and Pathfinder inference in Elixir, with a Builder API for model specification, an automatic compilation pipeline, and integration with the Nx/EXLA tensor ecosystem. The framework is documented through 52 architectural decisions with falsifiable assumptions, six of which were violated and revised during development. The system comprises approximately 5,000 lines of Elixir and 500 lines of Rust, with 199 tests.
 
-**Zero-cost fault-tolerant sampling.** BEAM's `try/rescue` mechanism provides fault containment for NUTS subtree computation with zero overhead on the non-faulting path (Chapter 3). A two-tier supervision mechanism — `try/rescue` for numerical and EXLA errors, `Task.yield` for hard hangs — replaces crashed subtrees with divergent placeholders that integrate seamlessly with the existing tree merge logic. Combined with three layers of numerical failure detection (leaf-level NaN/Inf checks, subtree early termination, trajectory-level divergence), Exmc provides four layers of fault tolerance. No existing PPL recovers from mid-sampling crashes.
+**Zero-cost fault-tolerant sampling.** BEAM's `try/rescue` mechanism provides fault containment for NUTS subtree computation with zero overhead on the non-faulting path (Chapter 3). A two-tier supervision mechanism — `try/rescue` for numerical and EXLA errors, `Task.yield` for hard hangs — replaces crashed subtrees with divergent placeholders that integrate seamlessly with the existing tree merge logic. Combined with three layers of numerical failure detection (leaf-level NaN/Inf checks, subtree early termination, trajectory-level divergence), Exmc provides four layers of fault tolerance. To our knowledge, this style of intra-tree crash recovery is not standard in mainstream PPL implementations.
 
-**Streaming inference via message passing.** The `sample_stream` protocol sends posterior samples as messages to any BEAM process (Chapter 4). This integrates directly with Scenic for real-time visualization (ExmcViz, 64 tests) and with Phoenix LiveView for browser-based posterior monitoring (12 tests). The LiveView integration requires no intermediate infrastructure — the web framework process serves directly as the sample receiver. No existing PPL provides streaming inference integrated with a production web framework.
+**Streaming inference via message passing.** The `sample_stream` protocol sends posterior samples as messages to any BEAM process (Chapter 4). This integrates directly with Scenic for real-time visualization (ExmcViz, 64 tests) and with Phoenix LiveView for browser-based posterior monitoring (12 tests). The LiveView integration requires no intermediate infrastructure — the web framework process serves directly as the sample receiver. To our knowledge, this direct integration pattern is uncommon in mainstream PPL tooling.
 
-**Distributed MCMC with transparent fault recovery.** Erlang's `:erpc` module enables multi-node chain dispatch where model IR is distributed to remote nodes that compile and sample independently (Chapter 5). Node failure triggers transparent retry on the coordinator. A 7-model distributed benchmark with 5 `:peer` nodes demonstrates avg 2.87x scaling, with Exmc distributed beating PyMC 4-chain on medium (841 vs 680, 1.24x) and funnel (5.4 vs 4.1, 1.32x). The closure barrier — Custom distributions capturing `Nx.Defn.Expr` tensor graph fragments — is identified as the distribution boundary; fault recovery provides 2.5-2.8x local concurrency as automatic fallback for non-distributable models. The entire distributed system is 203 lines with zero external dependencies.
+**Distributed MCMC with transparent fault recovery.** Erlang's `:erpc` module enables multi-node chain dispatch where model IR is distributed to remote nodes that compile and sample independently (Chapter 5). Node failure triggers transparent retry on the coordinator. A 7-model distributed benchmark with 5 same-host `:peer` nodes demonstrates avg 2.88x scaling, with Exmc distributed beating PyMC 4-chain on medium (841 vs 680, 1.24x) and funnel (5.4 vs 4.1, 1.32x). The closure barrier — Custom distributions capturing `Nx.Defn.Expr` tensor graph fragments — is identified as the distribution boundary; fault recovery provides 2.67-2.76x local concurrency as automatic fallback for non-distributable models. The entire distributed system is 203 lines with no external orchestrator.
 
-**JIT boundary cost model and gap decomposition.** We developed the first quantitative analysis of JIT boundary placement in mixed-runtime PPLs (Chapter 6). An affine cost model across 20 operations and 8 dimensions reveals three operation categories with distinct cost signatures: constant-overhead JIT dispatch, linearly-scaling tensor operations, and near-zero-cost native scalar arithmetic. The model identifies concrete crossover dimensions (e.g., d~6 for U-turn checks, d~72 for EXLA vs BinaryBackend). The gap decomposition methodology separates architectural overhead from algorithmic quality, revealing that a 34x performance gap can be reduced to **1.90x faster than PyMC** through parameterization choice, FFI boundary placement, progressive NIF migration, and multinomial sampling correctness fixes (Section 6.10.6).
+**JIT boundary cost model and gap decomposition.** We developed, to our knowledge, the first quantitative analysis of JIT boundary placement in mixed-runtime PPLs (Chapter 6). An affine cost model across 20 operations and 8 dimensions reveals three operation categories with distinct cost signatures: constant-overhead JIT dispatch, linearly-scaling tensor operations, and near-zero-cost native scalar arithmetic. The model identifies concrete crossover dimensions (e.g., d~6 for U-turn checks, d~72 for EXLA vs BinaryBackend). The gap decomposition methodology separates architectural overhead from algorithmic quality, revealing that a 34x performance gap can be reduced to **1.90x faster than PyMC** in this benchmark setting through parameterization choice, FFI boundary placement, progressive NIF migration, and multinomial sampling correctness fixes (Section 6.10.6).
 
 **GPU acceleration via batched JIT.** The device-agnostic JIT boundary architecture enables GPU acceleration without modifying the tree builder (Section 6.11.1). At d=22, GPU sampling achieves 2.65x wall-time speedup despite individual step_fn calls showing no GPU advantage at that dimension. The mechanism is the batched leapfrog (XLA while-loop), which amortizes kernel launch overhead across all steps within a subtree.
 
@@ -905,7 +910,7 @@ We identify several limitations of this work that constrain the generality of ou
 
 **Benchmark model coverage.** The optimization trajectory (Sections 6.1–6.10) was characterized primarily on three custom models (simple d=2, medium d=5, stress d=8). We subsequently validated these findings on four canonical PPL benchmarks — Eight Schools (d=10), Neal's Funnel (d=10), Logistic Regression (d=21), and Stochastic Volatility (d=102) — confirming the adaptation-vs-throughput tradeoff across model classes (Section 6.12). However, all seven models are unimodal with continuous parameters; multimodal posteriors, discrete parameters, and mixture models remain untested.
 
-**Same-host distributed benchmarks.** The distributed MCMC experiments (Chapter 5) use OTP `:peer` nodes on a single physical machine. These nodes share CPU cores, memory bandwidth, and the EXLA runtime. True multi-host benchmarks on separate machines would provide a more realistic assessment of distribution overhead and would likely show better scaling due to reduced resource contention. The 7-model distributed benchmark (Section 5.4) demonstrates avg 2.87x from 5 nodes on same-host; multi-host scaling should approach 5x with eliminated resource contention.
+**Same-host distributed benchmarks.** The distributed MCMC experiments (Chapter 5) use OTP `:peer` nodes on a single physical machine. These nodes share CPU cores, memory bandwidth, and the EXLA runtime. True multi-host benchmarks on separate machines would provide a more realistic assessment of distribution overhead and could change observed scaling under different network and hardware conditions. The 7-model distributed benchmark (Section 5.4) demonstrates avg 2.87x from 5 nodes on same-host.
 
 **Closure barrier limits distribution scope.** Custom distributions with `Nx.Defn.Expr`-captured tensors (logistic, SV) cannot distribute to remote nodes (Section 5.4). The fault recovery path provides 2.5-2.8x local concurrency, but this is fundamentally limited by single-host resources. The fix (embedding data in IR) is architectural and would require API changes.
 
@@ -933,7 +938,7 @@ Several directions emerge from this work.
 
 ### 7.4 Closing Statement
 
-The actor-model runtime provides fault tolerance, liveness, and distribution as language-level primitives. These properties are valuable for probabilistic programming but absent from every existing PPL. Exmc demonstrates that they are practically useful — not merely theoretically interesting — by enabling crash-resilient sampling, real-time browser-based posterior visualization, and multi-node inference with zero external infrastructure. The performance trajectory demonstrates that an interpreted runtime's overhead is not fixed: progressive optimization (backend placement, batched leapfrog, NIF subtrees, speculative pre-computation, multinomial sampling correctness) reduced the gap from 34x to **exceeding PyMC**. On a 7-model benchmark suite spanning d=2 to d=102 — including the canonical Eight Schools, Neal's Funnel, Logistic Regression, and Stochastic Volatility models — **Exmc wins 4 models to PyMC's 3**. Exmc wins on adaptation-bound models: medium 1.65x, stress 1.25x, Eight Schools 2.55x, and Stochastic Volatility 1.20x. PyMC wins on throughput-bound models: simple 0.81x, logistic 0.21x, and the pathological funnel 0.40x. This pattern reveals a structural tradeoff: an interpreted-host PPL with JIT'd gradients has equivalent adaptation quality but higher per-step overhead; which factor dominates depends on the model's geometry. The final 2–3x improvement came from fixing two subtle multinomial sampling bugs (Section 6.10.6) — capped leaf log-weights and balanced outer merge — that preserved MCMC correctness while silently inflating the duplicate sample rate from 7.8% to 37.7%. With distributed 4-node sampling via `:peer` nodes (Chapter 5), Exmc achieves 3.4–3.7x near-linear scaling, with medium model ESS/s of 812 — projected ~5x faster than PyMC's multiprocessing-based 4-chain approach. The discovery that five undocumented Stan practices (divergent Welford exclusion, Phase III allocation, sub-trajectory checks, uncapped leaf weights, biased progressive merge) each had measurable impact highlights the "folklore knowledge" barrier in PPL development — the gap between published algorithms and production implementations. The JIT boundary analysis provides a general framework for reasoning about performance in mixed-runtime systems and predicting where further optimization is profitable.
+The BEAM process runtime provides fault tolerance, liveness, and distribution as language-level primitives. These properties are valuable for probabilistic programming, and Exmc demonstrates that they are practically useful by enabling crash-resilient sampling, real-time browser-based posterior visualization, and multi-node inference with runtime-native distribution. The performance trajectory demonstrates that interpreted-runtime overhead is not fixed: progressive optimization (backend placement, batched leapfrog, NIF subtrees, speculative pre-computation, multinomial sampling correctness) reduced the gap from 34x to parity or better on several benchmarks. On a 7-model benchmark suite spanning d=2 to d=102 — including Eight Schools, Neal's Funnel, Logistic Regression, and Stochastic Volatility — Exmc wins 4 models to PyMC's 3 in this evaluation. Exmc wins on adaptation-bound models: medium 1.65x, stress 1.25x, Eight Schools 2.55x, and Stochastic Volatility 1.20x. PyMC wins on throughput-bound models: simple 0.81x, logistic 0.21x, and the pathological funnel 0.40x. This pattern reveals a structural tradeoff: an interpreted-host PPL with JIT'd gradients can achieve strong adaptation quality but pays higher per-step overhead; which factor dominates depends on model geometry. The final 2–3x improvement came from fixing two multinomial sampling bugs (Section 6.10.6) — capped leaf log-weights and balanced outer merge — that preserved MCMC correctness while inflating duplicate sample rate from 7.8% to 37.7%. With distributed 4-node same-host sampling via `:peer` nodes (Chapter 5), Exmc achieves 3.4–3.7x near-linear scaling, including medium model ESS/s of 812. The discovery that five undocumented Stan practices (divergent Welford exclusion, Phase III allocation, sub-trajectory checks, uncapped leaf weights, biased progressive merge) each had measurable impact highlights the gap between published algorithms and production implementations. The JIT boundary analysis provides a framework for reasoning about performance in mixed-runtime systems and identifying profitable optimization boundaries.
 
 ---
 
@@ -946,7 +951,7 @@ The actor-model runtime provides fault tolerance, liveness, and distribution as 
 | 3 | 6.9 | Dense mass hurts when warmup samples << d^2 |
 | 4 | 2.3 | NCP init inversion gives 2x ESS/s improvement |
 | 5 | 3.3 | Supervised tree building: zero-cost fault containment, 15 tests |
-| 6 | 5.3 | Distributed via :erpc: 1.66x ESS/s speedup, zero-cost fault recovery |
+| 6 | 5.3 | Distributed via :erpc on same-host `:peer` nodes: 1.66x ESS/s speedup, zero-cost fault recovery |
 | 7 | 4.3 | Live Bayesian inference via Phoenix LiveView, 12 tests |
 | 8 | 6.11 | JIT boundary cost model: 3-category fits (R²>0.99), GPU 2.65x at d=22 |
 | 9 | 7.3 | Actor-model sampling (planned future work) |
@@ -963,10 +968,10 @@ The actor-model runtime provides fault tolerance, liveness, and distribution as 
 | 20 | 6.10.4 | Adaptation quality (divergent skip + term_buffer): +180% stress, +109% medium |
 | 21 | 6.10.5 | Sub-trajectory U-turn checks: +46% medium ESS/s, -41% warmup divergences |
 | 22 | 6.10.6 | Multinomial sampling fixes (uncapped log_weight + biased progressive merge): duplicate rate 37.7%→6.5%, ESS 2-3x improvement. Exmc beats PyMC: medium 1.90x, stress 1.16x |
-| 23 | 5.3 | Distributed 4-node :peer benchmark: 3.4-3.7x near-linear scaling, medium 812 ESS/s |
-| 24 | 4.4 | Distributed live streaming: 4 nodes × 5000 samples, 948 samples/s, zero-integration composition of Ch 4 + Ch 5 |
-| 25 | 6.12 | Standard PPL benchmarks (7 models, d=2–102): Exmc 4, PyMC 3. Adaptation-bound models favor Exmc (Eight Schools 2.55x, medium 1.65x, stress 1.25x, SV 1.20x); throughput-bound favor PyMC (logistic 0.21x, simple 0.81x, funnel 0.40x) |
-| 26 | 5.4 | 7-model distributed benchmark: avg 2.87x scaling from 5 nodes. Exmc dist beats PyMC 4ch on medium (1.24x) and funnel (1.32x). Closure barrier: Custom dists with captured tensors fall back to coordinator via fault recovery (2.5-2.8x from local concurrency) |
+| 23 | 5.3 | Distributed 4-node same-host `:peer` benchmark: 3.4-3.7x near-linear scaling, medium 812 ESS/s |
+| 24 | 4.4 | Distributed live streaming on same-host `:peer` nodes: 4 nodes × 5000 samples, 948 samples/s, low-integration composition of Ch 4 + Ch 5 |
+| 25 | 6.12 | Standard PPL benchmarks (7 models, d=2–102, same-host): Exmc 4, PyMC 3 in this evaluation. Adaptation-bound models favor Exmc (Eight Schools 2.55x, medium 1.65x, stress 1.25x, SV 1.20x); throughput-bound favor PyMC (logistic 0.21x, simple 0.81x, funnel 0.40x) |
+| 26 | 5.4 | 7-model distributed same-host benchmark: avg 2.88x scaling from 5 `:peer` nodes. Exmc dist beats PyMC 4-chain on medium (1.24x) and funnel (1.32x). Closure barrier: Custom dists with captured tensors fall back to coordinator via fault recovery (2.67-2.76x from local concurrency) |
 
 ---
 
