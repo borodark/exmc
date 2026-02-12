@@ -1,12 +1,12 @@
 # Exmc
 
-**A new PPL environment on the BEAM, inspired by PyMC.** Exmc is a from-scratch Elixir implementation of PyMC’s architecture: declarative model specification, automatic constraint transforms, NUTS sampling, and Bayesian diagnostics — all on Nx tensors with optional EXLA acceleration.
+**A Probabilistic Programming environment on the BEAM, inspired by PyMC.** Exmc is a from-scratch Elixir implementation of PyMC’s architecture: declarative model specification, automatic constraint transforms, NUTS sampling, and Bayesian diagnostics — all on Nx tensors with optional EXLA acceleration.
 
 **With deep respect:** this project builds on the ideas, rigor, and ergonomics pioneered by the PyMC community. The goal is not to replace PyMC. The goal is to preserve correctness and usability while exploring what changes when the runtime is the BEAM.
 
 ![Live Streaming Dashboard](assets/live_streaming.png)
 
-## Why A New PPL Environment?
+## Why A New Probabilistic Programming Environment?
 
 PyMC established a high bar for statistical correctness, extensibility, and user experience. Exmc asks a focused question:
 
