@@ -12,8 +12,8 @@ defmodule Exmc.NUTS.Leapfrog do
   Returns `{q_new, p_new, logp_new, grad_new}`.
   """
   def step(vag_fn, q, p, grad, epsilon, inv_mass) do
-    eps = Nx.tensor(epsilon, type: :f64, backend: Nx.BinaryBackend)
-    half_eps = Nx.divide(eps, Nx.tensor(2.0, type: :f64, backend: Nx.BinaryBackend))
+    eps = Nx.tensor(epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
+    half_eps = Nx.divide(eps, Nx.tensor(2.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend))
 
     # half step for momentum
     p_half = Nx.add(p, Nx.multiply(half_eps, grad))
@@ -37,7 +37,7 @@ defmodule Exmc.NUTS.Leapfrog do
   Returns a scalar Nx tensor.
   """
   def kinetic_energy(p, inv_mass) do
-    half = Nx.tensor(0.5, type: :f64, backend: Nx.BinaryBackend)
+    half = Nx.tensor(0.5, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
     Nx.multiply(half, Nx.sum(Nx.multiply(p, mass_times_p(inv_mass, p))))
   end
 
@@ -69,7 +69,7 @@ defmodule Exmc.NUTS.Leapfrog do
   """
   def sample_momentum(key, inv_mass_diag) do
     shape = Nx.shape(inv_mass_diag)
-    {z, key} = Nx.Random.normal(key, shape: shape, type: :f64)
+    {z, key} = Nx.Random.normal(key, shape: shape, type: Exmc.JIT.precision())
     p = Nx.divide(z, Nx.sqrt(inv_mass_diag))
     {p, key}
   end

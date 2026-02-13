@@ -13,17 +13,19 @@ defmodule Exmc.Dist.StudentT do
 
   @impl true
   def logpdf(x, %{df: df, loc: loc, scale: scale}) do
-    z = Nx.divide(Nx.subtract(x, loc), scale)
+    safe_scale = Nx.max(scale, Nx.tensor(1.0e-30))
+    safe_df = Nx.max(df, Nx.tensor(1.0e-30))
+    z = Nx.divide(Nx.subtract(x, loc), safe_scale)
     z2 = Nx.multiply(z, z)
 
-    half_dfp1 = Nx.divide(Nx.add(df, Nx.tensor(1.0)), Nx.tensor(2.0))
-    half_df = Nx.divide(df, Nx.tensor(2.0))
+    half_dfp1 = Nx.divide(Nx.add(safe_df, Nx.tensor(1.0)), Nx.tensor(2.0))
+    half_df = Nx.divide(safe_df, Nx.tensor(2.0))
 
     Exmc.Math.lgamma(half_dfp1)
     |> Nx.subtract(Exmc.Math.lgamma(half_df))
-    |> Nx.subtract(Nx.multiply(Nx.tensor(0.5), Nx.log(Nx.multiply(df, Nx.tensor(:math.pi())))))
-    |> Nx.subtract(Nx.log(scale))
-    |> Nx.subtract(Nx.multiply(half_dfp1, Nx.log(Nx.add(Nx.tensor(1.0), Nx.divide(z2, df)))))
+    |> Nx.subtract(Nx.multiply(Nx.tensor(0.5), Nx.log(Nx.multiply(safe_df, Nx.tensor(:math.pi())))))
+    |> Nx.subtract(Nx.log(safe_scale))
+    |> Nx.subtract(Nx.multiply(half_dfp1, Nx.log(Nx.add(Nx.tensor(1.0), Nx.divide(z2, safe_df)))))
   end
 
   @impl true

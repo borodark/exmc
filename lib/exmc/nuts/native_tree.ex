@@ -7,7 +7,12 @@ defmodule Exmc.NUTS.NativeTree do
   term encoding overhead for large tensor data.
   """
 
-  use Rustler, otp_app: :exmc, crate: :exmc_tree
+  @cargo_available match?({_output, 0}, System.cmd("which", ["cargo"], stderr_to_stdout: true))
+
+  use Rustler,
+    otp_app: :exmc,
+    crate: :exmc_tree,
+    skip_compilation?: not @cargo_available
 
   # --- Binary API (performance path) ---
 

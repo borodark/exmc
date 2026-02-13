@@ -13,8 +13,10 @@ defmodule Exmc.Dist.Laplace do
 
   @impl true
   def logpdf(x, %{mu: mu, b: b}) do
-    Nx.negate(Nx.log(Nx.multiply(Nx.tensor(2.0), b)))
-    |> Nx.subtract(Nx.divide(Nx.abs(Nx.subtract(x, mu)), b))
+    safe_b = Nx.max(b, Nx.tensor(1.0e-30))
+
+    Nx.negate(Nx.log(Nx.multiply(Nx.tensor(2.0), safe_b)))
+    |> Nx.subtract(Nx.divide(Nx.abs(Nx.subtract(x, mu)), safe_b))
   end
 
   @impl true

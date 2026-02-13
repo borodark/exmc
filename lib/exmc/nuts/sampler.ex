@@ -143,7 +143,7 @@ defmodule Exmc.NUTS.Sampler do
 
       stats = %{
         step_size: 0.0,
-        inv_mass_diag: Nx.broadcast(Nx.tensor(0.0, type: :f64), {0}),
+        inv_mass_diag: Nx.tensor(0.0, type: Exmc.JIT.precision()),
         divergences: 0,
         num_warmup: num_warmup,
         num_samples: num_samples
@@ -165,7 +165,7 @@ defmodule Exmc.NUTS.Sampler do
       grad = Nx.backend_copy(grad, Nx.BinaryBackend)
 
       # Initialize mass matrix (identity, diagonal)
-      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: :f64, backend: Nx.BinaryBackend), {d})
+      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend), {d})
 
       # Use generic step_fn for dense mode (dispatches on mass shape)
       active_step_fn = if use_dense, do: build_generic_step_fn(vag_fn), else: step_fn
@@ -266,7 +266,7 @@ defmodule Exmc.NUTS.Sampler do
 
       stats = %{
         step_size: 0.0,
-        inv_mass_diag: Nx.broadcast(Nx.tensor(0.0, type: :f64), {0}),
+        inv_mass_diag: Nx.tensor(0.0, type: Exmc.JIT.precision()),
         divergences: 0,
         num_warmup: 0,
         num_samples: num_samples,
@@ -332,7 +332,7 @@ defmodule Exmc.NUTS.Sampler do
         {val * 0.1, rng}
       end)
 
-    q = Nx.tensor(values, type: :f64, backend: Nx.BinaryBackend)
+    q = Nx.tensor(values, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
     {q, rng}
   end
 
@@ -386,7 +386,7 @@ defmodule Exmc.NUTS.Sampler do
         {p, rng}
       end)
 
-    p = Nx.tensor(p_values, type: :f64, backend: Nx.BinaryBackend)
+    p = Nx.tensor(p_values, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
     {p, rng}
   end
 
@@ -406,7 +406,7 @@ defmodule Exmc.NUTS.Sampler do
         {z, rng}
       end)
 
-    z = Nx.tensor(z_values, type: :f64, backend: Nx.BinaryBackend)
+    z = Nx.tensor(z_values, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
     # Solve L^T @ p = z (L^T is upper triangular)
     z_col = Nx.reshape(z, {d, 1})
     p_col = Nx.LinAlg.triangular_solve(Nx.transpose(chol_cov), z_col, lower: false)
@@ -423,8 +423,8 @@ defmodule Exmc.NUTS.Sampler do
   # Returns 5-tuple: {q, p, logp, grad, joint_logp} to match compiled step_fn.
   defp build_generic_step_fn(vag_fn) do
     fn q, p, grad, epsilon, inv_mass ->
-      eps = Nx.tensor(epsilon, type: :f64, backend: Nx.BinaryBackend)
-      half_eps = Nx.divide(eps, Nx.tensor(2.0, type: :f64, backend: Nx.BinaryBackend))
+      eps = Nx.tensor(epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
+      half_eps = Nx.divide(eps, Nx.tensor(2.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend))
       p_half = Nx.add(p, Nx.multiply(half_eps, grad))
       q_new = Nx.add(q, Nx.multiply(eps, Leapfrog.mass_times_p(inv_mass, p_half)))
       {logp_new, grad_new} = vag_fn.(q_new)
@@ -1026,7 +1026,7 @@ defmodule Exmc.NUTS.Sampler do
 
       empty_stats = %{
         step_size: 0.0,
-        inv_mass_diag: Nx.broadcast(Nx.tensor(0.0, type: :f64), {0}),
+        inv_mass_diag: Nx.tensor(0.0, type: Exmc.JIT.precision()),
         divergences: 0,
         num_warmup: num_warmup,
         num_samples: num_samples,
@@ -1045,7 +1045,7 @@ defmodule Exmc.NUTS.Sampler do
       {logp0, grad0} = vag_fn.(q0)
       logp0 = Nx.backend_copy(logp0, Nx.BinaryBackend)
       grad0 = Nx.backend_copy(grad0, Nx.BinaryBackend)
-      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: :f64, backend: Nx.BinaryBackend), {d})
+      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend), {d})
       active_step_fn = if use_dense, do: build_generic_step_fn(vag_fn), else: step_fn
 
       {epsilon, rng0} =
@@ -1210,7 +1210,7 @@ defmodule Exmc.NUTS.Sampler do
       {logp, grad} = vag_fn.(q)
       logp = Nx.backend_copy(logp, Nx.BinaryBackend)
       grad = Nx.backend_copy(grad, Nx.BinaryBackend)
-      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: :f64, backend: Nx.BinaryBackend), {d})
+      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend), {d})
       active_step_fn = if use_dense, do: build_generic_step_fn(vag_fn), else: step_fn
 
       {epsilon, rng} =
@@ -1305,7 +1305,7 @@ defmodule Exmc.NUTS.Sampler do
 
   defp resolve_trace_value(v, trace) when is_binary(v), do: Map.fetch!(trace, v)
   defp resolve_trace_value(%Nx.Tensor{} = v, _trace), do: v
-  defp resolve_trace_value(v, _trace) when is_number(v), do: Nx.tensor(v, type: :f64)
+  defp resolve_trace_value(v, _trace) when is_number(v), do: Nx.tensor(v, type: Exmc.JIT.precision())
 
   # Topological sort for NCP entries: process entries whose NCP dependencies are resolved first
   defp ncp_topo_order(ncp_info) do

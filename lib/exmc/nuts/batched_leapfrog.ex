@@ -27,8 +27,15 @@ defmodule Exmc.NUTS.BatchedLeapfrog do
   reconstructing logp as joint_logp + KE.
   """
   def build(logp_fn, d, jit_opts \\ []) do
-    EXLA.jit(
-      &multi_step(&1, &2, &3, &4, &5, &6, logp_fn: logp_fn, d: d, max_steps: @max_steps),
+    fp = Exmc.JIT.precision()
+
+    Exmc.JIT.jit(
+      &multi_step(&1, &2, &3, &4, &5, &6,
+        logp_fn: logp_fn,
+        d: d,
+        max_steps: @max_steps,
+        fp: fp
+      ),
       Keyword.merge([on_conflict: :reuse], jit_opts)
     )
   end
@@ -37,15 +44,23 @@ defmodule Exmc.NUTS.BatchedLeapfrog do
     logp_fn = opts[:logp_fn]
     d = opts[:d]
     max_steps = opts[:max_steps]
+    fp = opts[:fp]
 
-    two = Nx.tensor(2.0, type: :f64)
+    # Ensure all inputs match target precision (f32 for EMLX, f64 for EXLA)
+    q = Nx.as_type(q, fp)
+    p = Nx.as_type(p, fp)
+    grad = Nx.as_type(grad, fp)
+    eps = Nx.as_type(Nx.reshape(eps, {}), fp)
+    inv_mass = Nx.as_type(inv_mass, fp)
+
+    two = Nx.tensor(2.0, type: fp)
     half_eps = eps / two
-    half = Nx.tensor(0.5, type: :f64)
+    half = Nx.tensor(0.5, type: fp)
 
-    all_q = Nx.broadcast(Nx.tensor(0.0, type: :f64), {max_steps, d})
-    all_p = Nx.broadcast(Nx.tensor(0.0, type: :f64), {max_steps, d})
-    all_logp = Nx.broadcast(Nx.tensor(0.0, type: :f64), {max_steps})
-    all_grad = Nx.broadcast(Nx.tensor(0.0, type: :f64), {max_steps, d})
+    all_q = Nx.broadcast(Nx.tensor(0.0, type: fp), {max_steps, d})
+    all_p = Nx.broadcast(Nx.tensor(0.0, type: fp), {max_steps, d})
+    all_logp = Nx.broadcast(Nx.tensor(0.0, type: fp), {max_steps})
+    all_grad = Nx.broadcast(Nx.tensor(0.0, type: fp), {max_steps, d})
     i = Nx.tensor(0, type: :s64)
 
     {{_q, _p, _grad, all_q, all_p, all_logp, all_grad, _i, _half_eps, _eps, _inv_mass, _half,
@@ -57,6 +72,9 @@ defmodule Exmc.NUTS.BatchedLeapfrog do
         p_half = p + half_eps * grad
         q_new = q + eps * (inv_mass * p_half)
         {logp_new, grad_new} = value_and_grad(q_new, logp_fn)
+        # Cast back to target precision — Evaluator/BinaryBackend may return f64
+        logp_new = Nx.as_type(logp_new, fp)
+        grad_new = Nx.as_type(grad_new, fp)
         p_new = p_half + half_eps * grad_new
 
         # Store raw logp (not joint_logp) — tree builder computes joint_logp at leaf time

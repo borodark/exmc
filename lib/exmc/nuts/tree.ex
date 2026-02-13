@@ -179,8 +179,8 @@ defmodule Exmc.NUTS.Tree do
 
     budget = min(trunc(:math.pow(2, budget_depth)) - 1, 1023)
 
-    eps_t = Nx.tensor(epsilon, type: :f64, backend: Nx.BinaryBackend)
-    neg_eps_t = Nx.tensor(-epsilon, type: :f64, backend: Nx.BinaryBackend)
+    eps_t = Nx.tensor(epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
+    neg_eps_t = Nx.tensor(-epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
     budget_t = Nx.tensor(budget, type: :s64)
 
     # Pre-compute forward chain (+epsilon) from q0
@@ -202,23 +202,23 @@ defmodule Exmc.NUTS.Tree do
     bwd_logp = Nx.backend_copy(bwd_logp, Nx.BinaryBackend)
     bwd_grad = Nx.backend_copy(bwd_grad, Nx.BinaryBackend)
 
-    # Slice to valid rows and convert to binary
-    fwd_q_bin = Nx.slice(fwd_q, [0, 0], [budget, d]) |> Nx.to_binary()
-    fwd_p_bin = Nx.slice(fwd_p, [0, 0], [budget, d]) |> Nx.to_binary()
-    fwd_logp_bin = Nx.slice(fwd_logp, [0], [budget]) |> Nx.to_binary()
-    fwd_grad_bin = Nx.slice(fwd_grad, [0, 0], [budget, d]) |> Nx.to_binary()
+    # Slice to valid rows and convert to f64 binary for Rust NIF
+    fwd_q_bin = Nx.slice(fwd_q, [0, 0], [budget, d]) |> to_nif_binary()
+    fwd_p_bin = Nx.slice(fwd_p, [0, 0], [budget, d]) |> to_nif_binary()
+    fwd_logp_bin = Nx.slice(fwd_logp, [0], [budget]) |> to_nif_binary()
+    fwd_grad_bin = Nx.slice(fwd_grad, [0, 0], [budget, d]) |> to_nif_binary()
 
-    bwd_q_bin = Nx.slice(bwd_q, [0, 0], [budget, d]) |> Nx.to_binary()
-    bwd_p_bin = Nx.slice(bwd_p, [0, 0], [budget, d]) |> Nx.to_binary()
-    bwd_logp_bin = Nx.slice(bwd_logp, [0], [budget]) |> Nx.to_binary()
-    bwd_grad_bin = Nx.slice(bwd_grad, [0, 0], [budget, d]) |> Nx.to_binary()
+    bwd_q_bin = Nx.slice(bwd_q, [0, 0], [budget, d]) |> to_nif_binary()
+    bwd_p_bin = Nx.slice(bwd_p, [0, 0], [budget, d]) |> to_nif_binary()
+    bwd_logp_bin = Nx.slice(bwd_logp, [0], [budget]) |> to_nif_binary()
+    bwd_grad_bin = Nx.slice(bwd_grad, [0, 0], [budget, d]) |> to_nif_binary()
 
-    # Initial state as binary
-    q0_bin = Nx.to_binary(q)
-    p0_bin = Nx.to_binary(p)
-    grad0_bin = Nx.to_binary(grad)
+    # Initial state as f64 binary for Rust NIF
+    q0_bin = to_nif_binary(q)
+    p0_bin = to_nif_binary(p)
+    grad0_bin = to_nif_binary(grad)
     logp0 = Nx.to_number(logp)
-    inv_mass_bin = Nx.to_binary(inv_mass_diag)
+    inv_mass_bin = to_nif_binary(inv_mass_diag)
 
     # Seed Rust PRNG from Elixir PRNG
     {rng_seed_val, _rng} = :rand.uniform_s(rng)
@@ -249,12 +249,11 @@ defmodule Exmc.NUTS.Tree do
         rng_seed
       )
 
-    # Convert NIF result to standard return format
+    # Convert NIF result (f64 binary) to standard return format in working precision
     %{
-      q: Nx.from_binary(nif_result.q_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d}),
-      logp: Nx.tensor(nif_result.logp, type: :f64, backend: Nx.BinaryBackend),
-      grad:
-        Nx.from_binary(nif_result.grad_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d}),
+      q: from_nif_binary(nif_result.q_bin, {d}),
+      logp: Nx.tensor(nif_result.logp, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend),
+      grad: from_nif_binary(nif_result.grad_bin, {d}),
       n_steps: nif_result.n_steps,
       divergent: nif_result.divergent,
       accept_sum: nif_result.accept_sum,
@@ -517,7 +516,7 @@ defmodule Exmc.NUTS.Tree do
         dir_sign = if direction == :fwd, do: 1.0, else: -1.0
 
         eps_t =
-          Nx.tensor(dir_sign * spec_buf.epsilon, type: :f64, backend: Nx.BinaryBackend)
+          Nx.tensor(dir_sign * spec_buf.epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
 
         n_t = Nx.tensor(batch_size, type: :s64)
 
@@ -565,7 +564,7 @@ defmodule Exmc.NUTS.Tree do
         dir_sign = if direction == :fwd, do: 1.0, else: -1.0
 
         eps_t =
-          Nx.tensor(dir_sign * spec_buf.epsilon, type: :f64, backend: Nx.BinaryBackend)
+          Nx.tensor(dir_sign * spec_buf.epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
 
         n_t = Nx.tensor(to_compute, type: :s64)
 
@@ -694,13 +693,13 @@ defmodule Exmc.NUTS.Tree do
     n_steps = trunc(:math.pow(2, depth))
     d = Nx.axis_size(sliced_q, 1)
 
-    # Convert to binaries (already BinaryBackend — cheap)
-    all_q_bin = Nx.slice(sliced_q, [0, 0], [n_steps, d]) |> Nx.to_binary()
-    all_p_bin = Nx.slice(sliced_p, [0, 0], [n_steps, d]) |> Nx.to_binary()
-    all_logp_bin = Nx.slice(sliced_logp, [0], [n_steps]) |> Nx.to_binary()
-    all_grad_bin = Nx.slice(sliced_grad, [0, 0], [n_steps, d]) |> Nx.to_binary()
+    # Convert to f64 binaries for Rust NIF
+    all_q_bin = Nx.slice(sliced_q, [0, 0], [n_steps, d]) |> to_nif_binary()
+    all_p_bin = Nx.slice(sliced_p, [0, 0], [n_steps, d]) |> to_nif_binary()
+    all_logp_bin = Nx.slice(sliced_logp, [0], [n_steps]) |> to_nif_binary()
+    all_grad_bin = Nx.slice(sliced_grad, [0, 0], [n_steps, d]) |> to_nif_binary()
 
-    inv_mass_bin = Nx.to_binary(inv_mass_diag)
+    inv_mass_bin = to_nif_binary(inv_mass_diag)
 
     # Seed Rust PRNG from Elixir PRNG
     {rng_seed_val, rng} = :rand.uniform_s(rng)
@@ -752,7 +751,7 @@ defmodule Exmc.NUTS.Tree do
     raw_logps = Nx.to_flat_list(Nx.slice(sliced_logp, [0], [n_steps])) |> List.to_tuple()
 
     counter = :atomics.new(1, signed: false)
-    half = Nx.tensor(0.5, type: :f64, backend: Nx.BinaryBackend)
+    half = Nx.tensor(0.5, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
 
     cached_step_fn = fn _q, _p, _grad, _eps, _inv_mass ->
       idx = :atomics.get(counter, 1)
@@ -760,7 +759,7 @@ defmodule Exmc.NUTS.Tree do
 
       q_new = Nx.slice(sliced_q, [idx, 0], [1, d]) |> Nx.reshape({d})
       p_new = Nx.slice(sliced_p, [idx, 0], [1, d]) |> Nx.reshape({d})
-      logp_new = Nx.tensor(elem(raw_logps, idx), type: :f64, backend: Nx.BinaryBackend)
+      logp_new = Nx.tensor(elem(raw_logps, idx), type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
       grad_new = Nx.slice(sliced_grad, [idx, 0], [1, d]) |> Nx.reshape({d})
 
       ke = Nx.multiply(half, Nx.sum(Nx.multiply(p_new, Nx.multiply(inv_mass_diag, p_new))))
@@ -773,7 +772,7 @@ defmodule Exmc.NUTS.Tree do
     # pre-sliced buffer by atomic counter. We pass dummy q; p and grad are
     # used only for the initial subtree structure (not passed to step_fn at
     # depth 0 — step_fn is called, but it ignores q/p/grad args).
-    dummy_q = Nx.broadcast(Nx.tensor(0.0, type: :f64, backend: Nx.BinaryBackend), {d})
+    dummy_q = Nx.broadcast(Nx.tensor(0.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend), {d})
 
     build_subtree(
       cached_step_fn,
@@ -959,55 +958,122 @@ defmodule Exmc.NUTS.Tree do
        ) do
     FaultInjector.maybe_fault!(0)
 
-    {q_new, p_new, logp_new, grad_new, joint_logp_t} =
-      step_fn.(q, p, grad, epsilon, inv_mass_diag)
+    # When EMLX falls back to BinaryBackend/Evaluator, extreme positions can
+    # cause ArithmeticError (Erlang throws on Inf/NaN unlike GPU). Catch and
+    # return divergent leaf instead of crashing the entire tree.
+    try do
+      {q_new, p_new, logp_new, grad_new, joint_logp_t} =
+        step_fn.(q, p, grad, epsilon, inv_mass_diag)
 
-    # Copy EXLA.Backend outputs to BinaryBackend for cheap Elixir-side arithmetic.
-    q_new = Nx.backend_copy(q_new, Nx.BinaryBackend)
-    p_new = Nx.backend_copy(p_new, Nx.BinaryBackend)
-    logp_new = Nx.backend_copy(logp_new, Nx.BinaryBackend)
-    grad_new = Nx.backend_copy(grad_new, Nx.BinaryBackend)
+      # Copy EXLA.Backend outputs to BinaryBackend for cheap Elixir-side arithmetic.
+      q_new = Nx.backend_copy(q_new, Nx.BinaryBackend)
+      p_new = Nx.backend_copy(p_new, Nx.BinaryBackend)
+      logp_new = Nx.backend_copy(logp_new, Nx.BinaryBackend)
+      grad_new = Nx.backend_copy(grad_new, Nx.BinaryBackend)
 
-    # joint_logp computed inside JIT — just extract the scalar
-    joint_logp_new = Nx.to_number(joint_logp_t)
+      # joint_logp computed inside JIT — just extract the scalar
+      joint_logp_new = Nx.to_number(joint_logp_t)
 
-    # Guard against NaN/Inf from numerical issues (e.g., log(0) gradient)
-    {divergent, log_weight, accept_prob} =
-      if is_number(joint_logp_new) do
-        d = joint_logp_new - joint_logp_0
-        {d < -1000.0, d, min(1.0, :math.exp(min(d, 0.0)))}
+      # Guard against NaN/Inf from numerical issues (e.g., log(0) gradient)
+      {divergent, log_weight, accept_prob} =
+        if is_number(joint_logp_new) do
+          d = joint_logp_new - joint_logp_0
+          {d < -1000.0, d, min(1.0, :math.exp(min(d, 0.0)))}
+        else
+          {true, -1001.0, 0.0}
+        end
+
+      # When divergent, fall back to original q/p to avoid NaN in flat lists
+      # (Erlang arithmetic throws on :nan atoms from Nx.to_flat_list)
+      if divergent do
+        q_list = Nx.to_flat_list(q)
+        p_list = Nx.to_flat_list(p)
+
+        subtree = %{
+          q_left: q,
+          p_left: p,
+          grad_left: grad,
+          q_left_list: q_list,
+          p_left_list: p_list,
+          q_right: q,
+          p_right: p,
+          grad_right: grad,
+          q_right_list: q_list,
+          p_right_list: p_list,
+          q_prop: q,
+          logp_prop: Nx.tensor(-1.0e30, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend),
+          grad_prop: grad,
+          rho_list: p_list,
+          depth: 0,
+          log_sum_weight: log_weight,
+          n_steps: 1,
+          divergent: true,
+          accept_sum: 0.0,
+          turning: false
+        }
+
+        {subtree, rng}
       else
-        {true, -1001.0, 0.0}
+        # Pre-extract flat lists once at leaf (avoids repeated Nx.to_flat_list in merges)
+        q_list = Nx.to_flat_list(q_new)
+        p_list = Nx.to_flat_list(p_new)
+
+        subtree = %{
+          q_left: q_new,
+          p_left: p_new,
+          grad_left: grad_new,
+          q_left_list: q_list,
+          p_left_list: p_list,
+          q_right: q_new,
+          p_right: p_new,
+          grad_right: grad_new,
+          q_right_list: q_list,
+          p_right_list: p_list,
+          q_prop: q_new,
+          logp_prop: logp_new,
+          grad_prop: grad_new,
+          rho_list: p_list,
+          depth: 0,
+          log_sum_weight: log_weight,
+          n_steps: 1,
+          divergent: false,
+          accept_sum: accept_prob,
+          turning: false
+        }
+
+        {subtree, rng}
       end
+    rescue
+      _e ->
+        # Numerical failure → treat as divergent leaf at the starting position
+        q_list = Nx.to_flat_list(q)
+        p_list = Nx.to_flat_list(p)
 
-    # Pre-extract flat lists once at leaf (avoids repeated Nx.to_flat_list in merges)
-    q_list = Nx.to_flat_list(q_new)
-    p_list = Nx.to_flat_list(p_new)
+        subtree = %{
+          q_left: q,
+          p_left: p,
+          grad_left: grad,
+          q_left_list: q_list,
+          p_left_list: p_list,
+          q_right: q,
+          p_right: p,
+          grad_right: grad,
+          q_right_list: q_list,
+          p_right_list: p_list,
+          q_prop: q,
+          logp_prop: Nx.tensor(-1.0e30, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend),
+          grad_prop: grad,
+          rho_list: p_list,
+          depth: 0,
+          log_sum_weight: -1001.0,
+          n_steps: 1,
+          divergent: true,
+          accept_sum: 0.0,
+          turning: false
+        }
 
-    subtree = %{
-      q_left: q_new,
-      p_left: p_new,
-      grad_left: grad_new,
-      q_left_list: q_list,
-      p_left_list: p_list,
-      q_right: q_new,
-      p_right: p_new,
-      grad_right: grad_new,
-      q_right_list: q_list,
-      p_right_list: p_list,
-      q_prop: q_new,
-      logp_prop: logp_new,
-      grad_prop: grad_new,
-      rho_list: p_list,
-      depth: 0,
-      log_sum_weight: log_weight,
-      n_steps: 1,
-      divergent: divergent,
-      accept_sum: accept_prob,
-      turning: false
-    }
-
-    {subtree, rng}
+        {subtree, rng}
+    end
   end
 
   # Recursive case: build two half-subtrees and merge
@@ -1099,7 +1165,7 @@ defmodule Exmc.NUTS.Tree do
     d = Nx.axis_size(q, 0)
 
     # Pre-compute all leapfrog steps in one JIT call
-    eps_t = Nx.tensor(epsilon, type: :f64, backend: Nx.BinaryBackend)
+    eps_t = Nx.tensor(epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
     n_t = Nx.tensor(n_steps, type: :s64)
     {all_q, all_p, all_logp, all_grad} = multi_step_fn.(q, p, grad, eps_t, inv_mass_diag, n_t)
 
@@ -1116,7 +1182,7 @@ defmodule Exmc.NUTS.Tree do
 
     # Cached step_fn: slices the i-th row from pre-computed tensors.
     # Returns the same 5-tuple as the real step_fn.
-    half = Nx.tensor(0.5, type: :f64, backend: Nx.BinaryBackend)
+    half = Nx.tensor(0.5, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
 
     cached_step_fn = fn _q, _p, _grad, _eps, _inv_mass ->
       idx = :atomics.get(counter, 1)
@@ -1124,7 +1190,7 @@ defmodule Exmc.NUTS.Tree do
 
       q_new = Nx.slice(all_q, [idx, 0], [1, d]) |> Nx.reshape({d})
       p_new = Nx.slice(all_p, [idx, 0], [1, d]) |> Nx.reshape({d})
-      logp_new = Nx.tensor(elem(raw_logps, idx), type: :f64, backend: Nx.BinaryBackend)
+      logp_new = Nx.tensor(elem(raw_logps, idx), type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
       grad_new = Nx.slice(all_grad, [idx, 0], [1, d]) |> Nx.reshape({d})
 
       ke = Nx.multiply(half, Nx.sum(Nx.multiply(p_new, Nx.multiply(inv_mass_diag, p_new))))
@@ -1172,7 +1238,7 @@ defmodule Exmc.NUTS.Tree do
     going_right = epsilon > 0
 
     # Pre-compute all leapfrog steps in one JIT call (same as build_subtree_cached)
-    eps_t = Nx.tensor(epsilon, type: :f64, backend: Nx.BinaryBackend)
+    eps_t = Nx.tensor(epsilon, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend)
     n_t = Nx.tensor(n_steps, type: :s64)
     {all_q, all_p, all_logp, all_grad} = multi_step_fn.(q, p, grad, eps_t, inv_mass_diag, n_t)
 
@@ -1182,12 +1248,12 @@ defmodule Exmc.NUTS.Tree do
     all_logp_b = Nx.backend_copy(all_logp, Nx.BinaryBackend)
     all_grad_b = Nx.backend_copy(all_grad, Nx.BinaryBackend)
 
-    all_q_bin = Nx.slice(all_q_b, [0, 0], [n_steps, d]) |> Nx.to_binary()
-    all_p_bin = Nx.slice(all_p_b, [0, 0], [n_steps, d]) |> Nx.to_binary()
-    all_logp_bin = Nx.slice(all_logp_b, [0], [n_steps]) |> Nx.to_binary()
-    all_grad_bin = Nx.slice(all_grad_b, [0, 0], [n_steps, d]) |> Nx.to_binary()
+    all_q_bin = Nx.slice(all_q_b, [0, 0], [n_steps, d]) |> to_nif_binary()
+    all_p_bin = Nx.slice(all_p_b, [0, 0], [n_steps, d]) |> to_nif_binary()
+    all_logp_bin = Nx.slice(all_logp_b, [0], [n_steps]) |> to_nif_binary()
+    all_grad_bin = Nx.slice(all_grad_b, [0, 0], [n_steps, d]) |> to_nif_binary()
 
-    inv_mass_bin = Nx.to_binary(inv_mass_diag)
+    inv_mass_bin = to_nif_binary(inv_mass_diag)
 
     # Seed Rust PRNG from Elixir PRNG
     {rng_seed_val, rng} = :rand.uniform_s(rng)
@@ -1218,10 +1284,10 @@ defmodule Exmc.NUTS.Tree do
 
   # Convert NIF subtree map (with binary data) to Elixir tree map (with Nx tensors + lists)
   defp nif_subtree_to_elixir(r, d) do
-    q_left = Nx.from_binary(r.q_left_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d})
-    p_left = Nx.from_binary(r.p_left_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d})
-    q_right = Nx.from_binary(r.q_right_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d})
-    p_right = Nx.from_binary(r.p_right_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d})
+    q_left = from_nif_binary(r.q_left_bin, {d})
+    p_left = from_nif_binary(r.p_left_bin, {d})
+    q_right = from_nif_binary(r.q_right_bin, {d})
+    p_right = from_nif_binary(r.p_right_bin, {d})
 
     # Decode rho from NIF binary
     rho_list =
@@ -1233,20 +1299,17 @@ defmodule Exmc.NUTS.Tree do
     %{
       q_left: q_left,
       p_left: p_left,
-      grad_left:
-        Nx.from_binary(r.grad_left_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d}),
+      grad_left: from_nif_binary(r.grad_left_bin, {d}),
       q_left_list: Nx.to_flat_list(q_left),
       p_left_list: Nx.to_flat_list(p_left),
       q_right: q_right,
       p_right: p_right,
-      grad_right:
-        Nx.from_binary(r.grad_right_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d}),
+      grad_right: from_nif_binary(r.grad_right_bin, {d}),
       q_right_list: Nx.to_flat_list(q_right),
       p_right_list: Nx.to_flat_list(p_right),
-      q_prop: Nx.from_binary(r.q_prop_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d}),
-      logp_prop: Nx.tensor(r.logp_prop, type: :f64, backend: Nx.BinaryBackend),
-      grad_prop:
-        Nx.from_binary(r.grad_prop_bin, :f64, backend: Nx.BinaryBackend) |> Nx.reshape({d}),
+      q_prop: from_nif_binary(r.q_prop_bin, {d}),
+      logp_prop: Nx.tensor(r.logp_prop, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend),
+      grad_prop: from_nif_binary(r.grad_prop_bin, {d}),
       rho_list: rho_list,
       log_sum_weight: r.log_sum_weight,
       n_steps: r.n_steps,
@@ -1507,7 +1570,7 @@ defmodule Exmc.NUTS.Tree do
       q_right_list: q_list,
       p_right_list: p_list,
       q_prop: q,
-      logp_prop: Nx.tensor(-1.0e300, type: :f64, backend: Nx.BinaryBackend),
+      logp_prop: Nx.tensor(-1.0e300, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend),
       grad_prop: grad,
       rho_list: p_list,
       depth: depth,
@@ -1520,5 +1583,20 @@ defmodule Exmc.NUTS.Tree do
     }
 
     {subtree, recovery_rng}
+  end
+
+  # --- NIF binary boundary: ensure f64 for Rust, convert back to working precision ---
+
+  # The Rust NIF reads all binaries as f64 (8 bytes per value).
+  # When EMLX is active, tensors are f32 (4 bytes). Without conversion,
+  # two f32 values get misread as one f64, producing garbage.
+  defp to_nif_binary(tensor) do
+    tensor |> Nx.as_type(:f64) |> Nx.to_binary()
+  end
+
+  defp from_nif_binary(binary, shape) do
+    Nx.from_binary(binary, :f64, backend: Nx.BinaryBackend)
+    |> Nx.reshape(shape)
+    |> Nx.as_type(Exmc.JIT.precision())
   end
 end

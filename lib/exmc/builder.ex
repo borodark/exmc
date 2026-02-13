@@ -21,6 +21,7 @@ defmodule Exmc.Builder do
   """
   def rv(%IR{} = ir, id, dist, params, opts \\ []) when is_binary(id) and is_map(params) do
     transform = Keyword.get(opts, :transform)
+    shape = Keyword.get(opts, :shape)
 
     op =
       if is_nil(transform) do
@@ -30,7 +31,7 @@ defmodule Exmc.Builder do
       end
 
     deps = params |> Map.values() |> Enum.filter(&is_binary/1)
-    node = %Node{id: id, op: op, deps: deps}
+    node = %Node{id: id, op: op, deps: deps, shape: shape}
     IR.add_node(ir, node)
   end
 

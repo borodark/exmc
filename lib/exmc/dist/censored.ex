@@ -15,12 +15,14 @@ defmodule Exmc.Dist.Censored do
 
   @doc "Compute censored log-likelihood for Normal distribution."
   def log_likelihood(:right, x, Exmc.Dist.Normal, %{mu: mu, sigma: sigma}) do
-    z = Nx.divide(Nx.subtract(x, mu), sigma)
+    safe_sigma = Nx.max(sigma, Nx.tensor(1.0e-30))
+    z = Nx.divide(Nx.subtract(x, mu), safe_sigma)
     log_sf(z)
   end
 
   def log_likelihood(:left, x, Exmc.Dist.Normal, %{mu: mu, sigma: sigma}) do
-    z = Nx.divide(Nx.subtract(x, mu), sigma)
+    safe_sigma = Nx.max(sigma, Nx.tensor(1.0e-30))
+    z = Nx.divide(Nx.subtract(x, mu), safe_sigma)
     log_cdf(z)
   end
 
@@ -28,8 +30,9 @@ defmodule Exmc.Dist.Censored do
         mu: mu,
         sigma: sigma
       }) do
-    z_lo = Nx.divide(Nx.subtract(lower, mu), sigma)
-    z_hi = Nx.divide(Nx.subtract(upper, mu), sigma)
+    safe_sigma = Nx.max(sigma, Nx.tensor(1.0e-30))
+    z_lo = Nx.divide(Nx.subtract(lower, mu), safe_sigma)
+    z_hi = Nx.divide(Nx.subtract(upper, mu), safe_sigma)
     Nx.log(Nx.subtract(normal_cdf(z_hi), normal_cdf(z_lo)))
   end
 

@@ -37,14 +37,15 @@ defmodule Exmc.PointMap do
       |> Enum.sort_by(& &1.id)
       |> Enum.reduce({[], 0}, fn node, {acc, offset} ->
         shape = node_shape(node)
-        length = shape_length(shape)
         transform = node_transform(node)
+        length = unconstrained_length(transform, shape)
+        unc_shape = unconstrained_shape(transform, shape)
 
         entry = %{
           id: node.id,
           offset: offset,
           length: length,
-          shape: shape,
+          shape: unc_shape,
           transform: transform
         }
 
@@ -67,11 +68,11 @@ defmodule Exmc.PointMap do
         value_map
         |> Map.fetch!(entry.id)
         |> Nx.reshape({entry.length})
-        |> Nx.as_type(:f64)
+        |> Nx.as_type(Exmc.JIT.precision())
       end)
 
     case tensors do
-      [] -> Nx.tensor([], type: :f64)
+      [] -> Nx.tensor([], type: Exmc.JIT.precision())
       _ -> Nx.concatenate(tensors)
     end
   end
@@ -150,8 +151,13 @@ defmodule Exmc.PointMap do
     end
   end
 
-  defp shape_length({}), do: 1
-  defp shape_length(shape), do: Tuple.product(shape)
+  defp unconstrained_length(transform, shape) do
+    Transform.unconstrained_length(transform, shape)
+  end
+
+  defp unconstrained_shape(transform, shape) do
+    Transform.unconstrained_shape(transform, shape)
+  end
 
   defp node_transform(node) do
     case node.op do
@@ -165,4 +171,5 @@ defmodule Exmc.PointMap do
   defp inverse_transform(:log, x), do: Nx.log(x)
   defp inverse_transform(:softplus, x), do: Nx.log(Nx.expm1(x))
   defp inverse_transform(:logit, x), do: Nx.subtract(Nx.log(x), Nx.log1p(Nx.negate(x)))
+  defp inverse_transform(:stick_breaking, x), do: Transform.inverse_stick_breaking(x)
 end

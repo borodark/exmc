@@ -106,18 +106,18 @@ defmodule Exmc.LogProb do
 
     case rv_node.op do
       {:rv, dist, params} ->
-        x = Nx.LinAlg.solve(a, value)
+        x = jit_solve(a, value)
         logp = dist.logpdf(x, params)
-        jac = Nx.negate(Nx.log(Nx.abs(Nx.LinAlg.determinant(a))))
+        jac = Nx.negate(Nx.log(Nx.abs(jit_determinant(a))))
         apply_obs_meta([Nx.add(logp, jac)], meta)
 
       {:rv, dist, params, transform} ->
-        x = Nx.LinAlg.solve(a, value)
+        x = jit_solve(a, value)
         z = inverse_transform(transform, x)
         x2 = Transform.apply(transform, z)
         logp = dist.logpdf(x2, params)
         jac = Transform.log_abs_det_jacobian(transform, z)
-        meas_jac = Nx.negate(Nx.log(Nx.abs(Nx.LinAlg.determinant(a))))
+        meas_jac = Nx.negate(Nx.log(Nx.abs(jit_determinant(a))))
         apply_obs_meta([Nx.add(Nx.add(logp, jac), meas_jac)], meta)
 
       _ ->
@@ -196,4 +196,15 @@ defmodule Exmc.LogProb do
 
   defp to_tensor(%Nx.Tensor{} = t), do: t
   defp to_tensor(v) when is_number(v) or is_boolean(v), do: Nx.tensor(v)
+
+  # JIT-wrap LinAlg ops to avoid Nx 0.10 BinaryBackend LU bug on small matrices
+  defp jit_determinant(a) do
+    Exmc.JIT.jit(fn x -> Nx.LinAlg.determinant(x) end).(a)
+    |> Nx.backend_copy(Nx.BinaryBackend)
+  end
+
+  defp jit_solve(a, b) do
+    Exmc.JIT.jit(fn {x, y} -> Nx.LinAlg.solve(x, y) end).({a, b})
+    |> Nx.backend_copy(Nx.BinaryBackend)
+  end
 end

@@ -2,7 +2,7 @@ defmodule Exmc.NotebooksTest do
   use ExUnit.Case, async: true
 
   test "notebooks exist and are valid livemd" do
-    notebooks_dir = Path.expand("../../notebooks", __DIR__)
+    notebooks_dir = Path.expand("../notebooks", __DIR__)
     assert File.dir?(notebooks_dir)
 
     livemd_files = Path.wildcard(Path.join(notebooks_dir, "*.livemd"))
@@ -16,7 +16,7 @@ defmodule Exmc.NotebooksTest do
   end
 
   test "each notebook has Mix.install block" do
-    notebooks_dir = Path.expand("../../notebooks", __DIR__)
+    notebooks_dir = Path.expand("../notebooks", __DIR__)
     livemd_files = Path.wildcard(Path.join(notebooks_dir, "*.livemd"))
 
     for file <- livemd_files do

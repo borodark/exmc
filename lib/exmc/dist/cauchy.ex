@@ -13,11 +13,12 @@ defmodule Exmc.Dist.Cauchy do
 
   @impl true
   def logpdf(x, %{loc: loc, scale: scale}) do
-    z = Nx.divide(Nx.subtract(x, loc), scale)
+    safe_scale = Nx.max(scale, Nx.tensor(1.0e-30))
+    z = Nx.divide(Nx.subtract(x, loc), safe_scale)
     z2 = Nx.multiply(z, z)
 
     Nx.tensor(-:math.log(:math.pi()))
-    |> Nx.subtract(Nx.log(scale))
+    |> Nx.subtract(Nx.log(safe_scale))
     |> Nx.subtract(Nx.log(Nx.add(Nx.tensor(1.0), z2)))
   end
 

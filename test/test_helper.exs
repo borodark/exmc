@@ -1,5 +1,10 @@
-Nx.default_backend(EXLA.Backend)
-Nx.Defn.default_options(compiler: EXLA)
+Nx.default_backend(Exmc.JIT.backend())
+
+case Exmc.JIT.detect_compiler() do
+  nil -> :ok
+  compiler -> Nx.Defn.default_options(compiler: compiler)
+end
+
 ExUnit.start()
 
 # Numeric compare helper for Nx tensors

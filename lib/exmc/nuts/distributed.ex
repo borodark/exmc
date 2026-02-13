@@ -131,7 +131,7 @@ defmodule Exmc.NUTS.Distributed do
     if pm.size == 0 do
       tuning = %{
         epsilon: 0.0,
-        inv_mass: Nx.broadcast(Nx.tensor(0.0, type: :f64), {0}),
+        inv_mass: Nx.broadcast(Nx.tensor(0.0, type: Exmc.JIT.precision()), {0}),
         chol_cov: nil
       }
 

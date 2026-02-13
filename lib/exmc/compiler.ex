@@ -107,15 +107,17 @@ defmodule Exmc.Compiler do
   end
 
   defp build_vag_fn(logp_fn, jit_opts \\ []) do
-    EXLA.jit(fn flat -> Nx.Defn.value_and_grad(flat, logp_fn) end, jit_opts)
+    Exmc.JIT.jit(fn flat -> Nx.Defn.value_and_grad(flat, logp_fn) end, jit_opts)
   end
 
   defp build_step_fn(logp_fn, _vag_fn, jit_opts \\ []) do
+    fp = Exmc.JIT.precision()
+
     jitted =
-      EXLA.jit(
+      Exmc.JIT.jit(
         fn q, p, grad, eps, inv_mass ->
-          two = Nx.tensor(2.0, type: :f64, backend: Nx.BinaryBackend)
-          half = Nx.tensor(0.5, type: :f64, backend: Nx.BinaryBackend)
+          two = Nx.tensor(2.0, type: fp, backend: Nx.BinaryBackend)
+          half = Nx.tensor(0.5, type: fp, backend: Nx.BinaryBackend)
           half_eps = Nx.divide(eps, two)
           p_half = Nx.add(p, Nx.multiply(half_eps, grad))
           q_new = Nx.add(q, Nx.multiply(eps, Nx.multiply(inv_mass, p_half)))
@@ -131,7 +133,7 @@ defmodule Exmc.Compiler do
       )
 
     fn q, p, grad, epsilon, inv_mass_diag ->
-      eps_t = Nx.tensor(epsilon, type: :f64, backend: Nx.BinaryBackend)
+      eps_t = Nx.tensor(epsilon, type: fp, backend: Nx.BinaryBackend)
       jitted.(q, p, grad, eps_t, inv_mass_diag)
     end
   end
@@ -166,6 +168,9 @@ defmodule Exmc.Compiler do
   # Free RV without transform
   defp node_term(%{id: id, op: {:rv, dist, params}}, _ir, pm, ncp_info) do
     if PointMap.has_entry?(pm, id) do
+      # Eagerly pre-compute derived constants (e.g. MvNormal prec from cov)
+      params = eager_prepare_params(dist, params)
+
       [
         fn vm ->
           resolved = resolve_params_constrained(params, vm, pm, ncp_info)
@@ -180,6 +185,9 @@ defmodule Exmc.Compiler do
   # Free RV with transform
   defp node_term(%{id: id, op: {:rv, dist, params, transform}}, _ir, pm, ncp_info) do
     if PointMap.has_entry?(pm, id) do
+      # Eagerly pre-compute derived constants
+      params = eager_prepare_params(dist, params)
+
       [
         fn vm ->
           resolved = resolve_params_constrained(params, vm, pm, ncp_info)
@@ -238,6 +246,7 @@ defmodule Exmc.Compiler do
   end
 
   defp eager_obs_term(%{op: {:rv, dist, params}}, value, meta) do
+    params = eager_prepare_params(dist, params)
     logp = dist.logpdf(value, params)
     [fn _vm -> apply_obs_meta(logp, meta) end]
   end
@@ -300,20 +309,20 @@ defmodule Exmc.Compiler do
   # --- Eager meas_obs computation ---
 
   defp eager_meas_obs_term(%{op: {:rv, dist, params}}, value, {:matmul, a}, meta) do
-    x = Nx.LinAlg.solve(a, value)
+    x = jit_solve(a, value)
     logp = dist.logpdf(x, params)
-    jac = Nx.negate(Nx.log(Nx.abs(Nx.LinAlg.determinant(a))))
+    jac = Nx.negate(Nx.log(Nx.abs(jit_determinant(a))))
     combined = Nx.add(logp, jac)
     [fn _vm -> apply_obs_meta(combined, meta) end]
   end
 
   defp eager_meas_obs_term(%{op: {:rv, dist, params, transform}}, value, {:matmul, a}, meta) do
-    x = Nx.LinAlg.solve(a, value)
+    x = jit_solve(a, value)
     z = inverse_transform(transform, x)
     x2 = Transform.apply(transform, z)
     logp = dist.logpdf(x2, params)
     jac = Transform.log_abs_det_jacobian(transform, z)
-    meas_jac = Nx.negate(Nx.log(Nx.abs(Nx.LinAlg.determinant(a))))
+    meas_jac = Nx.negate(Nx.log(Nx.abs(jit_determinant(a))))
     combined = Nx.add(Nx.add(logp, jac), meas_jac)
     [fn _vm -> apply_obs_meta(combined, meta) end]
   end
@@ -381,6 +390,7 @@ defmodule Exmc.Compiler do
   defp inverse_transform(:log, x), do: Nx.log(x)
   defp inverse_transform(:softplus, x), do: Nx.log(Nx.expm1(x))
   defp inverse_transform(:logit, x), do: Nx.subtract(Nx.log(x), Nx.log1p(Nx.negate(x)))
+  defp inverse_transform(:stick_breaking, x), do: Transform.inverse_stick_breaking(x)
 
   defp has_param_refs?(%{op: {:rv, _dist, params}}),
     do: Enum.any?(Map.values(params), &is_binary/1)
@@ -428,6 +438,16 @@ defmodule Exmc.Compiler do
     case Enum.find(pm.entries, fn e -> e.id == id end) do
       %{transform: t} -> t
       nil -> nil
+    end
+  end
+
+  # Eagerly pre-compute derived params for distributions that need it
+  # (e.g. MvNormal converts cov -> prec + log_det_cov to avoid LinAlg in traced code)
+  defp eager_prepare_params(dist, params) do
+    if function_exported?(dist, :prepare_params, 1) do
+      dist.prepare_params(params)
+    else
+      params
     end
   end
 
@@ -489,11 +509,25 @@ defmodule Exmc.Compiler do
   defp copy_op_info({:affine, a, b}), do: {:affine, to_binary(a), to_binary(b)}
   defp copy_op_info(other), do: other
 
+  # JIT-wrap LinAlg ops to avoid Nx 0.10 BinaryBackend LU bug on small matrices
+  defp jit_determinant(a) do
+    Exmc.JIT.jit(fn x -> Nx.LinAlg.determinant(x) end).(a)
+    |> Nx.backend_copy(Nx.BinaryBackend)
+  end
+
+  defp jit_solve(a, b) do
+    Exmc.JIT.jit(fn {x, y} -> Nx.LinAlg.solve(x, y) end).({a, b})
+    |> Nx.backend_copy(Nx.BinaryBackend)
+  end
+
   defp to_binary(%Nx.Tensor{} = t) do
-    case t.data do
-      %Nx.BinaryBackend{} -> t
-      _ -> Nx.backend_copy(t, Nx.BinaryBackend)
-    end
+    t =
+      case t.data do
+        %Nx.BinaryBackend{} -> t
+        _ -> Nx.backend_copy(t, Nx.BinaryBackend)
+      end
+
+    Exmc.JIT.ensure_precision(t)
   end
 
   defp to_binary(v), do: v

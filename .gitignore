@@ -26,3 +26,6 @@ deps/exla/cache/*
 # Rust NIF build artifacts
 /native/*/target/
 /priv/native/
+
+# Machine-specific CUDA libdevice symlink for XLA
+/cuda_sdk_lib/
