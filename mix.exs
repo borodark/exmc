@@ -32,7 +32,8 @@ defmodule Exmc.MixProject do
       {:nx, "~> 0.10.0"},
       {:exla, "~> 0.10", optional: true},
       {:emlx, "~> 0.2", optional: true},
-      {:rustler, "~> 0.36", runtime: false}
+      {:rustler, "~> 0.36", runtime: false},
+      {:jason, "~> 1.4"}
     ]
   end
 end

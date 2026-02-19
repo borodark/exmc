@@ -1186,9 +1186,6 @@ defmodule Exmc.NUTS.Sampler do
     stream_from_compiled_impl(vag_fn, step_fn, pm, ncp_info, receiver_pid, init_values, opts)
   end
 
-  defp stream_from_compiled({vag_fn, step_fn, pm, ncp_info}, receiver_pid, init_values, opts) do
-    stream_from_compiled_impl(vag_fn, step_fn, pm, ncp_info, receiver_pid, init_values, opts)
-  end
 
   defp stream_from_compiled_impl(vag_fn, step_fn, pm, ncp_info, receiver_pid, init_values, opts) do
     opts = Keyword.merge(@default_opts, opts)

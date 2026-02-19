@@ -85,7 +85,7 @@ defmodule Exmc.Compiler do
 
   # --- Internal compile pipeline ---
 
-  defp do_compile(%IR{} = ir, opts \\ []) do
+  defp do_compile(%IR{} = ir, opts) do
     ir = Rewrite.apply(ir, opts)
     ir = ensure_binary_backend(ir)
     pm = PointMap.build(ir)
@@ -110,7 +110,7 @@ defmodule Exmc.Compiler do
     Exmc.JIT.jit(fn flat -> Nx.Defn.value_and_grad(flat, logp_fn) end, jit_opts)
   end
 
-  defp build_step_fn(logp_fn, _vag_fn, jit_opts \\ []) do
+  defp build_step_fn(logp_fn, _vag_fn, jit_opts) do
     fp = Exmc.JIT.precision()
 
     jitted =
