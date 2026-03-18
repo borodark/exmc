@@ -13,7 +13,11 @@ defmodule Exmc.Dist.Censored do
       Builder.obs(ir, "obs", "x", %{lower: a, upper: b}, censored: :interval)
   """
 
-  @doc "Compute censored log-likelihood for Normal distribution."
+  @doc "Compute censored log-likelihood for a given distribution and censoring type."
+  def log_likelihood(:right, t, Exmc.Dist.Weibull, %{k: _k, lambda: _lambda} = params) do
+    Exmc.Dist.Weibull.log_survival(t, params)
+  end
+
   def log_likelihood(:right, x, Exmc.Dist.Normal, %{mu: mu, sigma: sigma}) do
     safe_sigma = Nx.max(sigma, Nx.tensor(1.0e-30))
     z = Nx.divide(Nx.subtract(x, mu), safe_sigma)

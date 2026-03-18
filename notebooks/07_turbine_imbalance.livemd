@@ -1,0 +1,613 @@
+# Bayesian Rotor Imbalance Tracking for Steam Turbines
+
+## Setup
+
+```elixir
+# EMLX (Metal GPU) on macOS Apple Silicon, EXLA (CPU/CUDA) elsewhere
+backend_dep =
+  case :os.type() do
+    {:unix, :darwin} -> {:emlx, "~> 0.2"}
+    _ -> {:exla, "~> 0.10"}
+  end
+
+Mix.install([
+  {:exmc, path: Path.expand("../", __DIR__)},
+  backend_dep,
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## The Jeffcott Rotor Model
+
+Every rotating machine vibrates. The dominant vibration at running speed (1X synchronous)
+is caused by mass imbalance — an uneven distribution of weight around the rotor centerline.
+
+The **Jeffcott rotor** model predicts the 1X vibration amplitude from the physics:
+
+$$A = \frac{U \cdot \omega^2}{\sqrt{(k - m\omega^2)^2 + (c\omega)^2}}$$
+
+* **U** — imbalance magnitude (g-mm), the mass-eccentricity product
+* **omega** — running speed (rad/s), measured by the keyphasor
+* **k** — bearing/shaft stiffness (N/m), approximately known from design
+* **c** — damping coefficient (N-s/m), approximately known from design
+* **m** — rotor mass (kg), known from design
+
+The question every turbine engineer asks: **"How bad is the imbalance, and when do I
+need to balance?"** Today this is answered by gut feel and fixed alarm thresholds.
+We answer it with a probability distribution.
+
+```elixir
+alias VegaLite, as: Vl
+alias Exmc.{Builder, NUTS.Sampler, Dist}
+
+# --- Rotor design parameters (known from OEM data) ---
+# Typical 50 MW steam turbine, 3600 RPM (60 Hz)
+rotor_mass = 5000.0           # kg
+omega = 3600.0 * 2 * :math.pi() / 60.0  # rad/s (376.99)
+k_design = 2.0e8              # N/m (bearing stiffness, approximate)
+c_design = 5.0e4              # N-s/m (damping coefficient, approximate)
+
+# Show how imbalance magnitude affects vibration amplitude
+imbalance_range = Enum.map(0..500, fn u -> u * 1.0 end)
+
+amp_data =
+  Enum.map(imbalance_range, fn u ->
+    # Convert g-mm to kg-m: 1 g-mm = 1e-6 kg-m
+    u_si = u * 1.0e-6
+    denom = :math.sqrt(:math.pow(k_design - rotor_mass * omega * omega, 2) + :math.pow(c_design * omega, 2))
+    a_m = u_si * omega * omega / denom
+    # Convert to mils peak-to-peak (1 mil = 25.4 um, p-p = 2 * amplitude)
+    a_mils = a_m * 1.0e6 / 25.4 * 2.0
+    %{"imbalance_gmm" => u, "amplitude_mils" => a_mils}
+  end)
+
+Vl.new(width: 700, height: 350, title: "Jeffcott Rotor: Vibration vs Imbalance at 3600 RPM")
+|> Vl.data_from_values(amp_data)
+|> Vl.mark(:line, stroke_width: 2, color: "#1f77b4")
+|> Vl.encode_field(:x, "imbalance_gmm", type: :quantitative, title: "Imbalance U (g-mm)")
+|> Vl.encode_field(:y, "amplitude_mils", type: :quantitative, title: "1X Vibration (mils p-p)")
+```
+
+## Synthetic Vibration Data
+
+We simulate 8 weeks of daily vibration readings from a turbine with gradually
+increasing imbalance — mimicking deposit buildup on turbine blades.
+
+```elixir
+# True parameters (unknown to the model)
+true_u_initial = 80.0     # g-mm (well-balanced rotor)
+true_growth_rate = 0.018   # per day (exponential growth from deposits)
+true_phi = 2.35            # radians (~135 degrees, heavy spot location)
+true_sigma = 0.08          # mils measurement noise
+
+# Generate 56 days (8 weeks) of daily observations
+days = Enum.to_list(1..56)
+rng = :rand.seed_s(:exsss, 42)
+
+# Physical constants for forward model
+u_to_amp = fn u_gmm ->
+  u_si = u_gmm * 1.0e-6
+  denom = :math.sqrt(:math.pow(k_design - rotor_mass * omega * omega, 2) + :math.pow(c_design * omega, 2))
+  a_m = u_si * omega * omega / denom
+  # mils p-p
+  a_m * 1.0e6 / 25.4 * 2.0
+end
+
+{observed, _rng} =
+  Enum.map_reduce(days, rng, fn day, rng ->
+    # True imbalance grows exponentially
+    u_true = true_u_initial * :math.exp(true_growth_rate * day)
+    a_true = u_to_amp.(u_true)
+
+    # Add lognormal measurement noise
+    {noise, rng} = :rand.normal_s(rng)
+    a_obs = a_true * :math.exp(true_sigma * noise)
+
+    {{day, a_obs, a_true, u_true}, rng}
+  end)
+
+# Alarm threshold: 2.5 mils p-p (API 670 typical)
+alarm_threshold = 2.5
+
+obs_data =
+  Enum.flat_map(observed, fn {day, a_obs, a_true, _u} ->
+    [
+      %{"day" => day, "amplitude" => a_obs, "series" => "Observed (1X probe)"},
+      %{"day" => day, "amplitude" => a_true, "series" => "True response"}
+    ]
+  end)
+
+alarm_line =
+  Enum.map(days, fn day ->
+    %{"day" => day, "amplitude" => alarm_threshold, "series" => "Alarm Threshold (2.5 mil)"}
+  end)
+
+Vl.new(
+  width: 700,
+  height: 350,
+  title: [
+    text: "Turbine Vibration Trend — 8 Weeks",
+    subtitle: "Unit 3, Bearing #2, X-probe"
+  ]
+)
+|> Vl.data_from_values(obs_data ++ alarm_line)
+|> Vl.layers([
+  Vl.new()
+  |> Vl.mark(:line, stroke_width: 2, stroke_dash: [6, 3], color: "#d62728")
+  |> Vl.transform(filter: "datum.series == 'Alarm Threshold (2.5 mil)'")
+  |> Vl.encode_field(:x, "day", type: :quantitative, title: "Day")
+  |> Vl.encode_field(:y, "amplitude", type: :quantitative, title: "1X Vibration (mils p-p)"),
+  Vl.new()
+  |> Vl.mark(:line, stroke_width: 1.5, stroke_dash: [4, 2], color: "#999")
+  |> Vl.transform(filter: "datum.series == 'True response'")
+  |> Vl.encode_field(:x, "day", type: :quantitative)
+  |> Vl.encode_field(:y, "amplitude", type: :quantitative),
+  Vl.new()
+  |> Vl.mark(:point, size: 40, filled: true, color: "#1f77b4")
+  |> Vl.transform(filter: "datum.series == 'Observed (1X probe)'")
+  |> Vl.encode_field(:x, "day", type: :quantitative)
+  |> Vl.encode_field(:y, "amplitude", type: :quantitative)
+])
+```
+
+## Bayesian Model
+
+We infer three latent parameters from the vibration amplitude observations:
+
+* `log_u` — log of imbalance magnitude (ensures positivity)
+* `phi` — phase angle of heavy spot
+* `sigma` — measurement noise scale
+
+The likelihood uses the Jeffcott forward model to predict vibration amplitude
+from the imbalance, then compares to observed data under lognormal noise.
+
+```elixir
+# Prepare data tensors — use first 28 days (4 weeks) initially
+n_obs = 28
+subset = Enum.take(observed, n_obs)
+a_obs_list = Enum.map(subset, fn {_, a, _, _} -> a end)
+day_list = Enum.map(subset, fn {d, _, _, _} -> d * 1.0 end)
+
+t_days = Nx.tensor(day_list)
+log_a_obs = Nx.tensor(Enum.map(a_obs_list, &:math.log/1))
+
+# Forward model constants (precomputed)
+# A(U) = U * 1e-6 * omega^2 / denom * 1e6/25.4 * 2
+# Simplify: A(U) = U * scale_factor
+denom_val = :math.sqrt(:math.pow(k_design - rotor_mass * omega * omega, 2) + :math.pow(c_design * omega, 2))
+scale_factor = 1.0e-6 * omega * omega / denom_val * 1.0e6 / 25.4 * 2.0
+scale_tensor = Nx.tensor(scale_factor)
+
+# Custom logpdf: Jeffcott rotor likelihood with exponential imbalance growth
+turbine_logpdf = fn _x, params ->
+  log_u0 = params.log_u0
+  growth = params.growth
+  sigma = params.sigma
+  t = params.t_days
+  log_a_observed = params.log_a_obs
+  scale = params.scale
+
+  # Predicted imbalance at each time: U(t) = U0 * exp(growth * t)
+  # Predicted amplitude: A(t) = U(t) * scale_factor
+  # log(A(t)) = log(U0) + growth * t + log(scale_factor)
+  log_a_pred = Nx.add(Nx.add(log_u0, Nx.multiply(growth, t)), Nx.log(scale))
+
+  # Lognormal likelihood
+  residuals = Nx.subtract(log_a_observed, log_a_pred)
+  n = Nx.tensor(Nx.size(log_a_observed) * 1.0)
+
+  Nx.subtract(
+    Nx.sum(Nx.negate(Nx.divide(Nx.pow(residuals, 2), Nx.multiply(2.0, Nx.pow(sigma, 2))))),
+    Nx.multiply(n, Nx.log(sigma))
+  )
+end
+
+# Build model IR
+ir = Builder.new_ir()
+
+# Priors informed by turbomachinery engineering knowledge
+# log_u0: well-balanced rotor ~50-150 g-mm
+ir = Builder.rv(ir, "log_u0", Dist.Normal, %{
+  mu: Nx.tensor(:math.log(100.0)),
+  sigma: Nx.tensor(0.8)
+})
+
+# growth rate: typically 0.005-0.05 per day for deposit buildup
+ir = Builder.rv(ir, "growth", Dist.Normal, %{
+  mu: Nx.tensor(0.015),
+  sigma: Nx.tensor(0.015)
+})
+
+# measurement noise
+ir = Builder.rv(ir, "sigma", Dist.HalfCauchy, %{
+  scale: Nx.tensor(0.2)
+}, transform: :log)
+
+# Custom likelihood
+turbine_dist = Dist.Custom.new(turbine_logpdf, support: :real)
+
+ir =
+  Dist.Custom.rv(ir, "ll", turbine_dist, %{
+    log_u0: "log_u0",
+    growth: "growth",
+    sigma: "sigma",
+    t_days: t_days,
+    log_a_obs: log_a_obs,
+    scale: scale_tensor
+  })
+
+ir = Builder.obs(ir, "ll_obs", "ll", Nx.tensor(0.0))
+
+IO.puts("Free parameters: #{inspect(Enum.sort(Map.keys(ir.nodes) -- ["ll", "ll_obs"]))}")
+IO.puts("Observations: #{n_obs} days of 1X vibration amplitude")
+ir
+```
+
+## MCMC Sampling
+
+```elixir
+init = %{
+  "log_u0" => :math.log(100.0),
+  "growth" => 0.015,
+  "sigma" => 0.15
+}
+
+t0 = System.monotonic_time(:millisecond)
+
+{trace, stats} =
+  Sampler.sample(ir, init,
+    num_warmup: 500,
+    num_samples: 500,
+    seed: 42,
+    ncp: false
+  )
+
+elapsed = System.monotonic_time(:millisecond) - t0
+
+u0_samples = trace["log_u0"] |> Nx.exp() |> Nx.to_flat_list() |> Enum.filter(&is_number/1)
+growth_samples = trace["growth"] |> Nx.to_flat_list() |> Enum.filter(&is_number/1)
+sigma_samples = trace["sigma"] |> Nx.to_flat_list() |> Enum.filter(&is_number/1)
+
+n_div = Enum.count(stats.sample_stats, & &1.divergent)
+
+IO.puts("Sampling complete in #{elapsed}ms")
+IO.puts("Divergences: #{n_div}")
+IO.puts("Step size: #{Float.round(stats.step_size, 4)}")
+```
+
+## Parameter Recovery
+
+```elixir
+summary = Exmc.Diagnostics.summary(trace)
+
+IO.puts("Parameter Recovery (4 weeks of data):\n")
+
+for {name, s} <- Enum.sort(summary) do
+  true_val =
+    case name do
+      "log_u0" -> :math.log(true_u_initial)
+      "growth" -> true_growth_rate
+      "sigma" -> true_sigma
+      _ -> nil
+    end
+
+  label =
+    case name do
+      "log_u0" -> "U0 (g-mm)"
+      "growth" -> "Growth (/day)"
+      "sigma" -> "Sigma"
+      _ -> name
+    end
+
+  display_mean =
+    case name do
+      "log_u0" -> Float.round(:math.exp(s.mean), 1)
+      _ -> Float.round(s.mean, 4)
+    end
+
+  display_true =
+    case name do
+      "log_u0" -> true_u_initial
+      "growth" -> true_growth_rate
+      "sigma" -> true_sigma
+      _ -> nil
+    end
+
+  IO.puts("  #{String.pad_trailing(label, 15)} posterior=#{display_mean}  true=#{display_true}")
+end
+
+:ok
+```
+
+## Trace Plots
+
+```elixir
+trace_data = fn samples, name ->
+  Enum.with_index(samples, fn val, i -> %{"iteration" => i, "value" => val, "param" => name} end)
+end
+
+all_traces =
+  trace_data.(u0_samples, "U0 (g-mm)") ++
+    trace_data.(growth_samples, "Growth rate (/day)") ++
+    trace_data.(sigma_samples, "Sigma (noise)")
+
+Vl.new(width: 700, height: 120, title: "MCMC Trace Plots")
+|> Vl.data_from_values(all_traces)
+|> Vl.mark(:line, opacity: 0.6, stroke_width: 0.5)
+|> Vl.encode_field(:x, "iteration", type: :quantitative)
+|> Vl.encode_field(:y, "value", type: :quantitative)
+|> Vl.encode_field(:row, "param", type: :nominal, title: nil,
+  header: [label_font_size: 11])
+|> Vl.resolve(:scale, y: :independent)
+```
+
+## Vibration Forecast: P10 / P50 / P90
+
+The key deliverable for turbine engineers. Each posterior sample generates a
+different forecast curve. We show the full uncertainty envelope for the next
+12 weeks, plus the alarm threshold.
+
+```elixir
+# Forecast 84 days (12 weeks) into the future
+forecast_days = Enum.to_list(1..84)
+n_draws = min(200, length(u0_samples))
+
+forecast_curves =
+  Enum.zip([
+    Enum.take(u0_samples, n_draws),
+    Enum.take(growth_samples, n_draws)
+  ])
+  |> Enum.map(fn {u0, growth} ->
+    Enum.map(forecast_days, fn day ->
+      u_t = u0 * :math.exp(growth * day)
+      u_to_amp.(u_t)
+    end)
+  end)
+
+percentiles =
+  Enum.map(Enum.with_index(forecast_days), fn {day, idx} ->
+    amps = Enum.map(forecast_curves, fn curve -> Enum.at(curve, idx) end) |> Enum.sort()
+    n = length(amps)
+    %{day: day,
+      p10: Enum.at(amps, round(0.1 * n)),
+      p50: Enum.at(amps, round(0.5 * n)),
+      p90: Enum.at(amps, round(0.9 * n))}
+  end)
+
+obs_points =
+  Enum.map(subset, fn {day, a, _, _} -> %{"day" => day, "amplitude" => a} end)
+
+alarm_data =
+  Enum.map(forecast_days, fn day -> %{"day" => day, "alarm" => alarm_threshold} end)
+
+Vl.new(
+  width: 700,
+  height: 400,
+  title: [
+    text: "Vibration Forecast: P10 / P50 / P90",
+    subtitle: "Alarm threshold at 2.5 mils p-p (API 670)"
+  ]
+)
+|> Vl.layers([
+  # Alarm threshold
+  Vl.new()
+  |> Vl.data_from_values(alarm_data)
+  |> Vl.mark(:line, stroke_width: 2, stroke_dash: [6, 3], color: "#d62728")
+  |> Vl.encode_field(:x, "day", type: :quantitative, title: "Day")
+  |> Vl.encode_field(:y, "alarm", type: :quantitative, title: "1X Vibration (mils p-p)"),
+  # P10-P90 band
+  Vl.new()
+  |> Vl.data_from_values(
+    Enum.map(percentiles, fn p ->
+      %{"day" => p.day, "p10" => p.p10, "p90" => p.p90}
+    end)
+  )
+  |> Vl.mark(:area, opacity: 0.25, color: "#1f77b4")
+  |> Vl.encode_field(:x, "day", type: :quantitative)
+  |> Vl.encode_field(:y, "p10", type: :quantitative)
+  |> Vl.encode_field(:y2, "p90"),
+  # P50 line
+  Vl.new()
+  |> Vl.data_from_values(
+    Enum.map(percentiles, fn p -> %{"day" => p.day, "amplitude" => p.p50} end)
+  )
+  |> Vl.mark(:line, stroke_width: 2.5, color: "#1f77b4")
+  |> Vl.encode_field(:x, "day", type: :quantitative)
+  |> Vl.encode_field(:y, "amplitude", type: :quantitative),
+  # Observed data
+  Vl.new()
+  |> Vl.data_from_values(obs_points)
+  |> Vl.mark(:point, size: 40, color: "#333", filled: true)
+  |> Vl.encode_field(:x, "day", type: :quantitative)
+  |> Vl.encode_field(:y, "amplitude", type: :quantitative)
+])
+```
+
+## Time to Alarm Threshold (RUL)
+
+When will the vibration cross the 2.5 mil alarm threshold?
+Each posterior sample gives a different answer. The distribution tells
+the maintenance planner exactly how much time they have.
+
+```elixir
+# For each posterior draw, compute when A(t) crosses alarm_threshold
+alarm_days =
+  Enum.zip([
+    Enum.take(u0_samples, n_draws),
+    Enum.take(growth_samples, n_draws)
+  ])
+  |> Enum.map(fn {u0, growth} ->
+    # Solve: u0 * exp(growth * t) * scale_factor = alarm_threshold
+    # t = log(alarm_threshold / (u0 * scale_factor)) / growth
+    a0 = u_to_amp.(u0)
+    if growth > 0.001 and a0 < alarm_threshold do
+      :math.log(alarm_threshold / a0) / growth
+    else
+      nil
+    end
+  end)
+  |> Enum.filter(&is_number/1)
+  |> Enum.filter(fn d -> d > 0 and d < 365 end)
+
+alarm_sorted = Enum.sort(alarm_days)
+n_alarm = length(alarm_sorted)
+
+if n_alarm > 10 do
+  rul_p10 = Enum.at(alarm_sorted, round(0.1 * n_alarm))
+  rul_p50 = Enum.at(alarm_sorted, round(0.5 * n_alarm))
+  rul_p90 = Enum.at(alarm_sorted, round(0.9 * n_alarm))
+
+  IO.puts("Time to Alarm Threshold (2.5 mils):")
+  IO.puts("  P10 (optimistic):    #{Float.round(rul_p10, 0)} days (#{Float.round(rul_p10 / 7, 1)} weeks)")
+  IO.puts("  P50 (median):        #{Float.round(rul_p50, 0)} days (#{Float.round(rul_p50 / 7, 1)} weeks)")
+  IO.puts("  P90 (conservative):  #{Float.round(rul_p90, 0)} days (#{Float.round(rul_p90 / 7, 1)} weeks)")
+  IO.puts("\n  Current practice: alarm triggers at 2.5 mil with ZERO advance notice.")
+  IO.puts("  Bayesian approach: #{Float.round(rul_p50 / 7, 0)} weeks of advance warning with uncertainty bounds.")
+end
+
+rul_hist = Enum.map(alarm_days, fn d -> %{"days_to_alarm" => d} end)
+
+Vl.new(
+  width: 600,
+  height: 300,
+  title: [
+    text: "Remaining Useful Life Distribution",
+    subtitle: "Days until vibration exceeds 2.5 mil alarm threshold"
+  ]
+)
+|> Vl.data_from_values(rul_hist)
+|> Vl.mark(:bar, opacity: 0.7, color: "#1f77b4")
+|> Vl.encode_field(:x, "days_to_alarm", type: :quantitative,
+  bin: [maxbins: 25], title: "Days to Alarm")
+|> Vl.encode(:y, aggregate: :count, title: "Count")
+```
+
+## Live Updating: Posterior Narrows as Data Accumulates
+
+The core eXMC value proposition for turbine diagnostics. As each day's vibration
+reading arrives, the posterior updates. Uncertainty shrinks. The maintenance
+window becomes clearer.
+
+```elixir
+run_turbine = fn days_of_data ->
+  sub = Enum.take(observed, days_of_data)
+  t_sub = Nx.tensor(Enum.map(sub, fn {d, _, _, _} -> d * 1.0 end))
+  log_a_sub = Nx.tensor(Enum.map(sub, fn {_, a, _, _} -> :math.log(a) end))
+
+  ir_sub = Builder.new_ir()
+  ir_sub = Builder.rv(ir_sub, "log_u0", Dist.Normal, %{mu: Nx.tensor(:math.log(100.0)), sigma: Nx.tensor(0.8)})
+  ir_sub = Builder.rv(ir_sub, "growth", Dist.Normal, %{mu: Nx.tensor(0.015), sigma: Nx.tensor(0.015)})
+  ir_sub = Builder.rv(ir_sub, "sigma", Dist.HalfCauchy, %{scale: Nx.tensor(0.2)}, transform: :log)
+  dist_sub = Dist.Custom.new(turbine_logpdf, support: :real)
+
+  ir_sub =
+    Dist.Custom.rv(ir_sub, "ll", dist_sub, %{
+      log_u0: "log_u0", growth: "growth", sigma: "sigma",
+      t_days: t_sub, log_a_obs: log_a_sub, scale: scale_tensor
+    })
+
+  ir_sub = Builder.obs(ir_sub, "ll_obs", "ll", Nx.tensor(0.0))
+
+  {tr, _} =
+    Sampler.sample(ir_sub, init, num_warmup: 500, num_samples: 300, seed: 42, ncp: false)
+
+  u0_s = tr["log_u0"] |> Nx.exp() |> Nx.to_flat_list() |> Enum.filter(&is_number/1)
+  gr_s = tr["growth"] |> Nx.to_flat_list() |> Enum.filter(&is_number/1)
+
+  # Compute time-to-alarm distribution
+  ruls =
+    Enum.zip([u0_s, gr_s])
+    |> Enum.map(fn {u0, g} ->
+      a0 = u_to_amp.(u0)
+      if g > 0.001 and a0 < alarm_threshold do
+        :math.log(alarm_threshold / a0) / g
+      else
+        nil
+      end
+    end)
+    |> Enum.filter(&is_number/1)
+    |> Enum.filter(fn d -> d > 0 and d < 365 end)
+    |> Enum.sort()
+
+  n_r = length(ruls)
+
+  %{
+    weeks: div(days_of_data, 7),
+    u0_mean: Enum.sum(u0_s) / length(u0_s),
+    u0_std: :math.sqrt(Enum.sum(Enum.map(u0_s, fn x -> :math.pow(x - Enum.sum(u0_s) / length(u0_s), 2) end)) / length(u0_s)),
+    growth_mean: Enum.sum(gr_s) / length(gr_s),
+    rul_p10: if(n_r > 10, do: Enum.at(ruls, round(0.1 * n_r)), else: nil),
+    rul_p50: if(n_r > 10, do: Enum.at(ruls, round(0.5 * n_r)), else: nil),
+    rul_p90: if(n_r > 10, do: Enum.at(ruls, round(0.9 * n_r)), else: nil)
+  }
+end
+
+# Run with increasing data
+stages = Enum.map([7, 14, 28, 42, 56], fn d -> run_turbine.(d) end)
+
+IO.puts("Sequential Updating — Uncertainty collapses as data arrives:\n")
+IO.puts("  Data     | U0 (g-mm)       | Growth (/day) | RUL P10  | RUL P50  | RUL P90")
+IO.puts("  ---------|-----------------|---------------|----------|----------|--------")
+
+for s <- stages do
+  u0_str = "#{Float.round(s.u0_mean, 0)} +/- #{Float.round(s.u0_std, 0)}"
+  rul_p10 = if s.rul_p10, do: "#{Float.round(s.rul_p10, 0)}d", else: "n/a"
+  rul_p50 = if s.rul_p50, do: "#{Float.round(s.rul_p50, 0)}d", else: "n/a"
+  rul_p90 = if s.rul_p90, do: "#{Float.round(s.rul_p90, 0)}d", else: "n/a"
+
+  IO.puts(
+    "  #{String.pad_trailing("#{s.weeks} weeks", 9)}" <>
+      "| #{String.pad_trailing(u0_str, 16)}" <>
+      "| #{String.pad_trailing(Float.round(s.growth_mean, 4) |> to_string(), 14)}" <>
+      "| #{String.pad_trailing(rul_p10, 9)}" <>
+      "| #{String.pad_trailing(rul_p50, 9)}" <>
+      "| #{rul_p90}"
+  )
+end
+```
+
+## What the Engineer Sees vs Current Practice
+
+```elixir
+IO.puts("""
++-------------------------+------------------------------+------------------------------------+
+| Aspect                  | Current Practice             | eXMC Bayesian Approach             |
++-------------------------+------------------------------+------------------------------------+
+| What operator sees      | "1X = 2.3 mils"              | "U = 120 [90, 160] g-mm,          |
+|                         |                              |  growing at 1.8 [1.4, 2.2] %/day" |
++-------------------------+------------------------------+------------------------------------+
+| Alarm logic             | Fixed threshold at 2.5 mil.  | P(U > U_alarm) = 0.23 and rising. |
+|                         | No advance warning.          | Weeks of advance warning.          |
++-------------------------+------------------------------+------------------------------------+
+| Trending                | Manual: analyst plots,       | Automatic: growth rate is a model  |
+|                         | eyeballs the curve.          | parameter with uncertainty.        |
++-------------------------+------------------------------+------------------------------------+
+| Balance decision        | "Gut feel + fixed calendar"  | "P50 = 5 weeks to alarm.          |
+|                         |                              |  Schedule balance at next outage   |
+|                         |                              |  in 3 weeks (90% safe)."           |
++-------------------------+------------------------------+------------------------------------+
+| After balancing         | Start from scratch.          | Update prior from balance shot.    |
+|                         |                              | Posterior immediately reflects     |
+|                         |                              | balance quality.                   |
++-------------------------+------------------------------+------------------------------------+
+| Cost of getting wrong   | Unplanned outage:            | Planned outage at optimal time:    |
+|                         | $500K-$2M/day.               | ~$50K. 10-40x savings.            |
++-------------------------+------------------------------+------------------------------------+
+""")
+```
+
+## Summary
+
+This notebook demonstrated Bayesian rotor imbalance tracking for steam turbines:
+
+1. **Jeffcott rotor model** maps vibration amplitude to physical imbalance parameters
+2. **Three latent parameters** (U0, growth rate, noise) are inferred from daily probe readings
+3. **P10/P50/P90 forecasts** predict when vibration will exceed alarm thresholds
+4. **Remaining Useful Life** distribution gives weeks of advance warning vs zero today
+5. **Live updating** — each new vibration reading narrows the posterior automatically
+
+No new sensors required. Uses existing proximity probe data via OPC-UA.
+Runs on edge hardware at the plant. Works offline. Survives crashes.
+
+With eXMC's `sample_stream/4`, this entire analysis runs as a live dashboard
+where posteriors update in real time as each vibration reading arrives from the DCS.

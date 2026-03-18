@@ -9,6 +9,18 @@ defmodule Exmc.Builder do
   def new_ir, do: IR.new()
 
   @doc """
+  Register observation data as a runtime JIT argument.
+
+  The tensor is passed as an XLA parameter (not a constant), so EXLA
+  caches by shape only — different data values with the same shape
+  reuse the compiled executable. Reference in Custom dist params via
+  the string `"__obs_data"`.
+  """
+  def data(%IR{} = ir, %Nx.Tensor{} = tensor) do
+    %{ir | data: tensor}
+  end
+
+  @doc """
   Add a random variable node to the IR.
 
   ## Examples

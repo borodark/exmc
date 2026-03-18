@@ -1,0 +1,164 @@
+# Radon Varying-Intercept Model
+
+## Setup
+
+```elixir
+# EMLX (Metal GPU) on macOS Apple Silicon, EXLA (CPU/CUDA) elsewhere
+backend_dep =
+  case :os.type() do
+    {:unix, :darwin} -> {:emlx, "~> 0.2"}
+    _ -> {:exla, "~> 0.10"}
+  end
+
+Mix.install([
+  {:exmc, path: Path.expand("../", __DIR__)},
+  backend_dep,
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## The Radon Model
+
+The **radon varying-intercept model** is the "MNIST of Bayesian hierarchical models" —
+introduced by Gelman & Hill (2007), it estimates indoor radon levels across counties
+with partial pooling of county intercepts toward a uranium-informed grand mean.
+
+This is a d=90 model: 5 hyperparameters + 85 county-level intercepts.
+
+**Model structure:**
+
+- `mu_alpha ~ Normal(0, 10)` — grand intercept mean
+- `gamma_u ~ Normal(0, 5)` — uranium coefficient (county-level predictor)
+- `sigma_alpha ~ HalfCauchy(2.5)` — county intercept spread
+- `sigma_y ~ HalfCauchy(2.5)` — observation noise
+- `beta ~ Normal(0, 5)` — floor effect (basement vs first floor)
+- `alpha_raw_j ~ Normal(0, 1)` for j = 0..84 — NCP county intercepts
+- `alpha_j = mu_alpha + gamma_u * uranium_j + sigma_alpha * alpha_raw_j`
+- `y_{ij} ~ Normal(alpha_j + beta * floor_{ij}, sigma_y)`
+
+```elixir
+# Generate synthetic radon data (85 counties, ~919 observations)
+Code.require_file("../benchmark/radon_data.exs", __DIR__)
+Code.require_file("../benchmark/radon_model.exs", __DIR__)
+
+data = Exmc.Benchmark.RadonData.generate(seed: 42)
+
+IO.puts("Counties: #{data.n_counties}")
+IO.puts("Total observations: #{length(data.county_idx)}")
+IO.puts("True mu_alpha: #{data.true_params.mu_alpha}")
+IO.puts("True beta (floor effect): #{data.true_params.beta}")
+IO.puts("True sigma_y: #{data.true_params.sigma_y}")
+```
+
+## Building and Sampling
+
+The model uses **manual non-centered parameterization (NCP)**: each county intercept
+is expressed as `alpha_raw_j ~ N(0,1)` and reconstructed inside a Custom dist closure.
+This lets the sampler explore the 85-dimensional intercept space without funnel geometry.
+
+```elixir
+ir = Exmc.Benchmark.RadonModel.build(data)
+init = Exmc.Benchmark.RadonModel.init_values(data)
+
+IO.puts("Free parameters: #{map_size(init)}")
+```
+
+```elixir
+t0 = System.monotonic_time(:millisecond)
+
+{trace, stats} =
+  Exmc.NUTS.Sampler.sample(ir, init,
+    num_warmup: 1000,
+    num_samples: 1000,
+    seed: 42,
+    ncp: false
+  )
+
+wall_s = (System.monotonic_time(:millisecond) - t0) / 1000.0
+IO.puts("Wall time: #{Float.round(wall_s, 1)}s")
+IO.puts("Step size: #{Float.round(stats.step_size, 4)}")
+IO.puts("Divergences: #{stats.divergences}")
+```
+
+## Posterior Summary
+
+```elixir
+alias Exmc.Diagnostics
+
+params = ["mu_alpha", "gamma_u", "sigma_alpha", "sigma_y", "beta"]
+true_vals = [1.4, 0.7, 0.4, 0.7, -0.7]
+
+for {name, true_val} <- Enum.zip(params, true_vals) do
+  samples = Nx.to_flat_list(trace[name])
+  mean = Enum.sum(samples) / length(samples)
+  ess = Diagnostics.ess(samples)
+
+  IO.puts(
+    "#{String.pad_trailing(name, 14)} mean=#{Float.round(mean, 3)} " <>
+      "(true=#{true_val}) ESS=#{Float.round(ess, 0)}"
+  )
+end
+```
+
+## County-Level Shrinkage
+
+The hallmark of hierarchical models is **shrinkage**: county estimates are pulled toward
+the group mean, with small-sample counties shrinking more. Let's visualize this.
+
+```elixir
+# Reconstruct county intercepts from trace
+alphas = Exmc.Benchmark.RadonModel.reconstruct_alphas(trace, data)
+
+# Compute posterior means for each county
+county_means =
+  Enum.map(0..(data.n_counties - 1), fn j ->
+    samples = Nx.to_flat_list(alphas[j])
+    mean = Enum.sum(samples) / length(samples)
+    n_obs = Enum.count(data.county_idx, &(&1 == j))
+    %{county: j, posterior_mean: mean, true_alpha: Enum.at(data.true_alphas, j), n_obs: n_obs}
+  end)
+```
+
+```elixir
+alias VegaLite, as: Vl
+
+# Shrinkage plot: posterior mean vs true alpha, sized by county sample size
+Vl.new(width: 600, height: 400, title: "County Intercept Shrinkage")
+|> Vl.data_from_values(county_means)
+|> Vl.mark(:circle, opacity: 0.7)
+|> Vl.encode_field(:x, "true_alpha", type: :quantitative, title: "True County Intercept")
+|> Vl.encode_field(:y, "posterior_mean", type: :quantitative, title: "Posterior Mean")
+|> Vl.encode_field(:size, "n_obs", type: :quantitative, title: "# Observations")
+|> Vl.encode_field(:color, "n_obs",
+  type: :quantitative,
+  scale: %{scheme: "viridis"},
+  title: "# Observations"
+)
+```
+
+```elixir
+# Grand mean line: alpha_j should cluster around mu_alpha + gamma_u * uranium_j
+mu_alpha_mean =
+  Nx.to_flat_list(trace["mu_alpha"]) |> then(&(Enum.sum(&1) / length(&1)))
+
+gamma_u_mean =
+  Nx.to_flat_list(trace["gamma_u"]) |> then(&(Enum.sum(&1) / length(&1)))
+
+IO.puts("Grand mean: mu_alpha=#{Float.round(mu_alpha_mean, 3)}, gamma_u=#{Float.round(gamma_u_mean, 3)}")
+IO.puts("Small counties shrink toward the group mean; large counties keep their local estimate.")
+```
+
+## Floor Effect
+
+Basement measurements (`floor=0`) should show higher radon than first-floor (`floor=1`).
+The `beta` parameter captures this — a negative value means first floor has lower radon.
+
+```elixir
+beta_samples = Nx.to_flat_list(trace["beta"])
+
+Vl.new(width: 500, height: 300, title: "Floor Effect (beta) Posterior")
+|> Vl.data_from_values(Enum.map(beta_samples, &%{beta: &1}))
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "beta", type: :quantitative, bin: %{maxbins: 40}, title: "beta")
+|> Vl.encode(:y, aggregate: :count, type: :quantitative)
+```

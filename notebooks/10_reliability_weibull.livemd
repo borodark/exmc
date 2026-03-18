@@ -1,0 +1,185 @@
+# Hierarchical Weibull Reliability
+
+## Setup
+
+```elixir
+# EMLX (Metal GPU) on macOS Apple Silicon, EXLA (CPU/CUDA) elsewhere
+backend_dep =
+  case :os.type() do
+    {:unix, :darwin} -> {:emlx, "~> 0.2"}
+    _ -> {:exla, "~> 0.10"}
+  end
+
+Mix.install([
+  {:exmc, path: Path.expand("../", __DIR__)},
+  backend_dep,
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## The Reliability Model
+
+**Hierarchical Weibull reliability** models failure times across component types with
+partial pooling of shape and scale parameters. This is a common industrial pattern for
+fleet-level reliability estimation where individual component types have limited data.
+
+This is a d=44 model: 4 hyperparameters + 20 types × 2 NCP params (shape + scale).
+
+**Model structure:**
+
+- `log_k_mean ~ Normal(0.5, 1.0)` — log-shape hyperprior mean
+- `log_k_sigma ~ HalfCauchy(1.0)` — log-shape spread
+- `log_l_mean ~ Normal(2.0, 1.0)` — log-scale hyperprior mean
+- `log_l_sigma ~ HalfCauchy(1.0)` — log-scale spread
+- `k_raw_j, l_raw_j ~ Normal(0, 1)` for j = 0..19 — NCP shape/scale params
+- `k_j = exp(log_k_mean + log_k_sigma * k_raw_j)` — Weibull shape for type j
+- `lambda_j = exp(log_l_mean + log_l_sigma * l_raw_j)` — Weibull scale for type j
+- `t_{ij} ~ Weibull(k_j, lambda_j)` with 20% right-censored observations
+
+```elixir
+Code.require_file("../benchmark/reliability_data.exs", __DIR__)
+Code.require_file("../benchmark/reliability_model.exs", __DIR__)
+
+data = Exmc.Benchmark.ReliabilityData.generate(seed: 42)
+
+IO.puts("Component types: #{data.n_types}")
+IO.puts("Observations per type: #{data.n_per_type}")
+
+# Show censoring summary
+total_obs = data.n_types * data.n_per_type
+total_cens = Enum.sum(Enum.map(data.obs_by_type, & &1.n_cens))
+IO.puts("Total observations: #{total_obs} (#{total_cens} right-censored, #{Float.round(100 * total_cens / total_obs, 1)}%)")
+```
+
+## Building and Sampling
+
+The model uses the new `Exmc.Dist.Weibull` distribution with right-censoring support
+via `Exmc.Dist.Censored`. The Weibull survival function `S(t) = exp(-(t/lambda)^k)`
+gives the log-likelihood contribution for censored observations.
+
+```elixir
+ir = Exmc.Benchmark.ReliabilityModel.build(data)
+init = Exmc.Benchmark.ReliabilityModel.init_values(data)
+
+IO.puts("Free parameters: #{map_size(init)}")
+```
+
+```elixir
+t0 = System.monotonic_time(:millisecond)
+
+{trace, stats} =
+  Exmc.NUTS.Sampler.sample(ir, init,
+    num_warmup: 1000,
+    num_samples: 1000,
+    seed: 42,
+    ncp: false
+  )
+
+wall_s = (System.monotonic_time(:millisecond) - t0) / 1000.0
+IO.puts("Wall time: #{Float.round(wall_s, 1)}s")
+IO.puts("Step size: #{Float.round(stats.step_size, 4)}")
+IO.puts("Divergences: #{stats.divergences}")
+```
+
+## Hyperprior Posteriors
+
+```elixir
+alias Exmc.Diagnostics
+
+hyperparams = Exmc.Benchmark.ReliabilityModel.reconstruct_params(trace, data)
+
+for {name, tensor} <- hyperparams do
+  samples = Nx.to_flat_list(tensor)
+  mean = Enum.sum(samples) / length(samples)
+  ess = Diagnostics.ess(samples)
+  IO.puts("#{name}: mean=#{Float.round(mean, 3)}, ESS=#{Float.round(ess, 0)}")
+end
+```
+
+## Per-Type Shape and Scale Recovery
+
+```elixir
+# Reconstruct per-type Weibull parameters from NCP trace
+type_params =
+  Enum.map(0..(data.n_types - 1), fn j ->
+    log_k_mean = Nx.to_flat_list(trace["log_k_mean"])
+    log_k_sigma = Nx.to_flat_list(trace["log_k_sigma"])
+    k_raw = Nx.to_flat_list(trace["k_raw_#{j}"])
+
+    log_l_mean = Nx.to_flat_list(trace["log_l_mean"])
+    log_l_sigma = Nx.to_flat_list(trace["log_l_sigma"])
+    l_raw = Nx.to_flat_list(trace["l_raw_#{j}"])
+
+    k_samples =
+      Enum.zip_with([log_k_mean, log_k_sigma, k_raw], fn [m, s, z] ->
+        :math.exp(m + s * z)
+      end)
+
+    l_samples =
+      Enum.zip_with([log_l_mean, log_l_sigma, l_raw], fn [m, s, z] ->
+        :math.exp(m + s * z)
+      end)
+
+    k_mean = Enum.sum(k_samples) / length(k_samples)
+    l_mean = Enum.sum(l_samples) / length(l_samples)
+
+    %{
+      type: j,
+      k_post: k_mean,
+      l_post: l_mean,
+      k_true: Enum.at(data.true_shapes, j),
+      l_true: Enum.at(data.true_scales, j)
+    }
+  end)
+```
+
+```elixir
+alias VegaLite, as: Vl
+
+# Shape recovery plot
+Vl.new(width: 500, height: 400, title: "Weibull Shape (k): True vs Posterior")
+|> Vl.data_from_values(type_params)
+|> Vl.mark(:circle, size: 80, opacity: 0.8)
+|> Vl.encode_field(:x, "k_true", type: :quantitative, title: "True k")
+|> Vl.encode_field(:y, "k_post", type: :quantitative, title: "Posterior Mean k")
+```
+
+```elixir
+# Scale recovery plot
+Vl.new(width: 500, height: 400, title: "Weibull Scale (λ): True vs Posterior")
+|> Vl.data_from_values(type_params)
+|> Vl.mark(:circle, size: 80, opacity: 0.8, color: "orange")
+|> Vl.encode_field(:x, "l_true", type: :quantitative, title: "True λ")
+|> Vl.encode_field(:y, "l_post", type: :quantitative, title: "Posterior Mean λ")
+```
+
+## Hazard Curves
+
+The **hazard function** `h(t) = (k/lambda) * (t/lambda)^(k-1)` gives the instantaneous
+failure rate. For k > 1, hazard increases (wear-out); for k < 1, it decreases (infant mortality).
+
+```elixir
+# Plot hazard curves for 5 selected component types
+selected_types = [0, 4, 9, 14, 19]
+t_grid = Enum.map(0..100, &(&1 * 0.3))
+
+hazard_data =
+  Enum.flat_map(selected_types, fn j ->
+    tp = Enum.at(type_params, j)
+    k = tp.k_post
+    l = tp.l_post
+
+    Enum.map(t_grid, fn t ->
+      t = max(t, 0.01)
+      h = (k / l) * :math.pow(t / l, k - 1)
+      %{t: t, hazard: min(h, 5.0), type: "Type #{j} (k=#{Float.round(k, 1)})"}
+    end)
+  end)
+
+Vl.new(width: 600, height: 400, title: "Estimated Hazard Curves by Component Type")
+|> Vl.data_from_values(hazard_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "t", type: :quantitative, title: "Time")
+|> Vl.encode_field(:y, "hazard", type: :quantitative, title: "Hazard Rate h(t)")
+|> Vl.encode_field(:color, "type", type: :nominal, title: "Component Type")
+```

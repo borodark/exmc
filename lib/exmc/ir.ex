@@ -3,14 +3,15 @@ defmodule Exmc.IR do
   Minimal probabilistic IR for logprob construction.
   """
 
-  defstruct nodes: %{}, outputs: [], ncp_info: %{}
+  defstruct nodes: %{}, outputs: [], ncp_info: %{}, data: nil
 
   alias Exmc.Node
 
   @type t :: %__MODULE__{
           nodes: %{required(String.t()) => Node.t()},
           outputs: [String.t()],
-          ncp_info: %{optional(String.t()) => %{mu: term(), sigma: term()}}
+          ncp_info: %{optional(String.t()) => %{mu: term(), sigma: term()}},
+          data: Nx.Tensor.t() | nil
         }
 
   @doc "Create an empty IR."

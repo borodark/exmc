@@ -13,6 +13,7 @@ defmodule Exmc.NUTS.BatchedLeapfrog do
   import Nx.Defn
 
   @max_steps 1024
+  @data_sentinel Nx.tensor(0.0, type: :f32, backend: Nx.BinaryBackend)
 
   @doc """
   Build a batched multi-step function for the given logp_fn and dimension.
@@ -26,21 +27,27 @@ defmodule Exmc.NUTS.BatchedLeapfrog do
   individual step_fn path exactly and avoiding float precision issues from
   reconstructing logp as joint_logp + KE.
   """
-  def build(logp_fn, d, jit_opts \\ []) do
+  def build(logp_fn, obs_data, d, jit_opts \\ []) do
     fp = Exmc.JIT.precision()
 
-    Exmc.JIT.jit(
-      &multi_step(&1, &2, &3, &4, &5, &6,
-        logp_fn: logp_fn,
-        d: d,
-        max_steps: @max_steps,
-        fp: fp
-      ),
-      Keyword.merge([on_conflict: :reuse], jit_opts)
-    )
+    raw =
+      Exmc.JIT.jit(
+        &multi_step(&1, &2, &3, &4, &5, &6, &7,
+          logp_fn: logp_fn,
+          d: d,
+          max_steps: @max_steps,
+          fp: fp
+        ),
+        Keyword.merge([on_conflict: :reuse], jit_opts)
+      )
+
+    data = obs_data || @data_sentinel
+    fn q, p, grad, eps, inv_mass, n_steps ->
+      raw.(q, p, grad, eps, inv_mass, n_steps, data)
+    end
   end
 
-  defnp multi_step(q, p, grad, eps, inv_mass, n_steps, opts \\ []) do
+  defnp multi_step(q, p, grad, eps, inv_mass, n_steps, data, opts \\ []) do
     logp_fn = opts[:logp_fn]
     d = opts[:d]
     max_steps = opts[:max_steps]
@@ -64,14 +71,14 @@ defmodule Exmc.NUTS.BatchedLeapfrog do
     i = Nx.tensor(0, type: :s64)
 
     {{_q, _p, _grad, all_q, all_p, all_logp, all_grad, _i, _half_eps, _eps, _inv_mass, _half,
-      _n_steps}} =
+      _n_steps, _data}} =
       while {{q, p, grad, all_q, all_p, all_logp, all_grad, i, half_eps, eps, inv_mass, half,
-              n_steps}},
+              n_steps, data}},
             i < n_steps do
         # Leapfrog step
         p_half = p + half_eps * grad
         q_new = q + eps * (inv_mass * p_half)
-        {logp_new, grad_new} = value_and_grad(q_new, logp_fn)
+        {logp_new, grad_new} = value_and_grad(q_new, fn f -> logp_fn.(f, data) end)
         # Cast back to target precision — Evaluator/BinaryBackend may return f64
         logp_new = Nx.as_type(logp_new, fp)
         grad_new = Nx.as_type(grad_new, fp)
@@ -87,7 +94,7 @@ defmodule Exmc.NUTS.BatchedLeapfrog do
         all_grad = Nx.put_slice(all_grad, [i, 0], Nx.reshape(grad_new, {1, d}))
 
         {{q_new, p_new, grad_new, all_q, all_p, all_logp, all_grad, i + 1, half_eps, eps,
-          inv_mass, half, n_steps}}
+          inv_mass, half, n_steps, data}}
       end
 
     {all_q, all_p, all_logp, all_grad}

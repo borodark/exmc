@@ -166,7 +166,8 @@ defmodule Exmc.Diagnostics do
     n / max(tau, 1.0)
   end
 
-  defp quantile(sorted, n, p) do
+  @doc "Linear interpolation quantile on a pre-sorted list."
+  def quantile(sorted, n, p) do
     # Linear interpolation quantile
     h = (n - 1) * p
     lo = floor(h)

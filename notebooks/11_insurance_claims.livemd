@@ -1,0 +1,181 @@
+# Hierarchical Insurance Claims
+
+## Setup
+
+```elixir
+# EMLX (Metal GPU) on macOS Apple Silicon, EXLA (CPU/CUDA) elsewhere
+backend_dep =
+  case :os.type() do
+    {:unix, :darwin} -> {:emlx, "~> 0.2"}
+    _ -> {:exla, "~> 0.10"}
+  end
+
+Mix.install([
+  {:exmc, path: Path.expand("../", __DIR__)},
+  backend_dep,
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## The Insurance Claims Model
+
+**Hierarchical Poisson frequency models** are standard in actuarial science for estimating
+claim rates across business segments. Partial pooling stabilizes estimates for small segments
+while letting large segments speak for themselves.
+
+This is a d=22 model: 2 hyperparameters + 20 segment-level NCP rates.
+
+**Model structure:**
+
+* `mu_global ~ Gamma(2, 0.5)` — global claim rate
+* `sigma_seg ~ HalfCauchy(1.0)` — segment rate spread
+* `mu_raw_j ~ Normal(0, 1)` for j = 0..19 — NCP segment offsets
+* `log(mu_j) = log(mu_global) + sigma_seg * mu_raw_j` — segment log-rate
+* `n_{ij} ~ Poisson(mu_j)` — claim counts per policy
+
+```elixir
+Code.require_file("../benchmark/insurance_data.exs", __DIR__)
+Code.require_file("../benchmark/insurance_model.exs", __DIR__)
+
+data = Exmc.Benchmark.InsuranceData.generate(seed: 42)
+
+IO.puts("Segments: #{data.n_segments}")
+IO.puts("Policies per segment: #{data.n_per_segment}")
+true_p = Exmc.Benchmark.InsuranceData.true_params()
+IO.puts("True global rate: #{true_p.mu_global}")
+IO.puts("True segment sigma: #{true_p.sigma_seg}")
+```
+
+## Building and Sampling
+
+```elixir
+ir = Exmc.Benchmark.InsuranceModel.build(data)
+init = Exmc.Benchmark.InsuranceModel.init_values(data)
+
+IO.puts("Free parameters: #{map_size(init)}")
+```
+
+```elixir
+t0 = System.monotonic_time(:millisecond)
+
+{trace, stats} =
+  Exmc.NUTS.Sampler.sample(ir, init,
+    num_warmup: 1000,
+    num_samples: 1000,
+    seed: 42,
+    ncp: false
+  )
+
+wall_s = (System.monotonic_time(:millisecond) - t0) / 1000.0
+IO.puts("Wall time: #{Float.round(wall_s, 1)}s")
+IO.puts("Step size: #{Float.round(stats.step_size, 4)}")
+IO.puts("Divergences: #{stats.divergences}")
+```
+
+## Global Hyperpriors
+
+```elixir
+alias Exmc.Diagnostics
+
+mu_global_samples = Nx.to_flat_list(trace["mu_global"])
+sigma_seg_samples = Nx.to_flat_list(trace["sigma_seg"])
+
+mu_mean = Enum.sum(mu_global_samples) / length(mu_global_samples)
+sigma_mean = Enum.sum(sigma_seg_samples) / length(sigma_seg_samples)
+
+IO.puts("mu_global: mean=#{Float.round(mu_mean, 3)} (true=3.0), ESS=#{Float.round(Diagnostics.ess(mu_global_samples), 0)}")
+IO.puts("sigma_seg: mean=#{Float.round(sigma_mean, 3)} (true=0.5), ESS=#{Float.round(Diagnostics.ess(sigma_seg_samples), 0)}")
+```
+
+```elixir
+alias VegaLite, as: Vl
+
+# Global rate posterior
+Vl.new(width: 500, height: 300, title: "Global Claim Rate (mu_global) Posterior")
+|> Vl.data_from_values(Enum.map(mu_global_samples, &%{mu: &1}))
+|> Vl.mark(:bar, color: "steelblue")
+|> Vl.encode_field(:x, "mu", type: :quantitative, bin: %{maxbins: 40}, title: "mu_global")
+|> Vl.encode(:y, aggregate: :count, type: :quantitative)
+```
+
+## Segment Rate Posteriors
+
+```elixir
+# Reconstruct segment rates from NCP trace
+seg_rates = Exmc.Benchmark.InsuranceModel.reconstruct_rates(trace, data)
+
+seg_summary =
+  Enum.map(seg_rates, fn {j, rate_tensor} ->
+    samples = Nx.to_flat_list(rate_tensor)
+    mean = Enum.sum(samples) / length(samples)
+    sorted = Enum.sort(samples)
+    lo = Enum.at(sorted, round(0.025 * length(sorted)))
+    hi = Enum.at(sorted, round(0.975 * length(sorted)))
+
+    %{
+      segment: j,
+      rate_post: mean,
+      lo_95: lo,
+      hi_95: hi,
+      rate_true: Enum.at(data.true_rates, j),
+      empirical: Nx.to_flat_list(Enum.at(data.counts_by_seg, j)) |> then(&(Enum.sum(&1) / length(&1)))
+    }
+  end)
+```
+
+```elixir
+# Segment rate comparison: true vs posterior vs empirical
+Vl.new(width: 600, height: 400, title: "Segment Claim Rates: Posterior vs True")
+|> Vl.data_from_values(seg_summary)
+|> Vl.layers([
+  # Error bars (95% CI)
+  Vl.new()
+  |> Vl.mark(:rule, color: "steelblue", opacity: 0.5)
+  |> Vl.encode_field(:x, "segment", type: :ordinal, title: "Segment")
+  |> Vl.encode_field(:y, "lo_95", type: :quantitative, title: "Claim Rate")
+  |> Vl.encode_field(:y2, "hi_95"),
+  # Posterior mean
+  Vl.new()
+  |> Vl.mark(:circle, size: 80, color: "steelblue")
+  |> Vl.encode_field(:x, "segment", type: :ordinal)
+  |> Vl.encode_field(:y, "rate_post", type: :quantitative),
+  # True rate
+  Vl.new()
+  |> Vl.mark(:diamond, size: 60, color: "red")
+  |> Vl.encode_field(:x, "segment", type: :ordinal)
+  |> Vl.encode_field(:y, "rate_true", type: :quantitative)
+])
+```
+
+## Shrinkage Effect
+
+The Bayesian model pulls extreme segment estimates toward the global mean,
+which stabilizes rate estimates for segments with noisy data.
+
+```elixir
+# Compare empirical (MLE) vs posterior (Bayes) estimates
+shrinkage_data =
+  Enum.map(seg_summary, fn s ->
+    %{
+      segment: s.segment,
+      estimate: s.rate_post,
+      type: "Posterior",
+      true_rate: s.rate_true
+    }
+  end) ++
+    Enum.map(seg_summary, fn s ->
+      %{
+        segment: s.segment,
+        estimate: s.empirical,
+        type: "Empirical (MLE)",
+        true_rate: s.rate_true
+      }
+    end)
+
+Vl.new(width: 600, height: 400, title: "Shrinkage: Empirical vs Bayesian Estimates")
+|> Vl.data_from_values(shrinkage_data)
+|> Vl.mark(:circle, size: 60, opacity: 0.8)
+|> Vl.encode_field(:x, "true_rate", type: :quantitative, title: "True Segment Rate")
+|> Vl.encode_field(:y, "estimate", type: :quantitative, title: "Estimated Rate")
+|> Vl.encode_field(:color, "type", type: :nominal, title: "Method")
+```

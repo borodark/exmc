@@ -9,6 +9,10 @@ defmodule Exmc.Compiler do
 
   alias Exmc.{IR, Rewrite, PointMap, Transform}
 
+  # Sentinel for models without observation data.
+  # A scalar constant — adds one trivial XLA parameter, compiles once.
+  @data_sentinel Nx.tensor(0.0, type: :f32, backend: Nx.BinaryBackend)
+
   @doc """
   Compile an IR into a logp function and its PointMap.
 
@@ -16,7 +20,10 @@ defmodule Exmc.Compiler do
   """
   def compile(%IR{} = ir, opts \\ []) do
     {logp_fn, pm, _ncp_info} = do_compile(ir, opts)
-    {logp_fn, pm}
+    # Wrap 2-arg logp_fn into 1-arg for public API (data baked in)
+    obs_data = ir.data || @data_sentinel
+    wrapped = fn flat -> logp_fn.(flat, obs_data) end
+    {wrapped, pm}
   end
 
   @doc """
@@ -25,8 +32,8 @@ defmodule Exmc.Compiler do
   Returns `{vag_fn, point_map}` where `vag_fn :: flat_tensor -> {logp, grad}`.
   """
   def value_and_grad(%IR{} = ir) do
-    {logp_fn, pm} = compile(ir)
-    {build_vag_fn(logp_fn), pm}
+    {logp_fn, pm, _ncp_info} = do_compile(ir, [])
+    {build_vag_fn(logp_fn, ir.data), pm}
   end
 
   @doc """
@@ -38,13 +45,14 @@ defmodule Exmc.Compiler do
   """
   def compile_for_sampling(%IR{} = ir, opts \\ []) do
     {logp_fn, pm, ncp_info} = do_compile(ir, opts)
+    obs_data = ir.data
     device = Keyword.get(opts, :device, :host)
     jit_opts = if device == :host, do: [], else: [client: device]
-    vag_fn = build_vag_fn(logp_fn, jit_opts)
-    step_fn = build_step_fn(logp_fn, vag_fn, jit_opts)
+    vag_fn = build_vag_fn(logp_fn, obs_data, jit_opts)
+    step_fn = build_step_fn(logp_fn, obs_data, jit_opts)
 
     multi_step_fn =
-      if pm.size > 0, do: Exmc.NUTS.BatchedLeapfrog.build(logp_fn, pm.size, jit_opts), else: nil
+      if pm.size > 0, do: Exmc.NUTS.BatchedLeapfrog.build(logp_fn, obs_data, pm.size, jit_opts), else: nil
 
     {vag_fn, step_fn, pm, ncp_info, multi_step_fn}
   end
@@ -92,36 +100,58 @@ defmodule Exmc.Compiler do
     ncp_info = ir.ncp_info || %{}
     terms = build_terms(ir, pm, ncp_info)
 
+    has_data? = ir.data != nil
+
+    # logp_fn :: (flat, data) -> scalar
+    # When IR has data, inject it into vm as "__obs_data" so Custom dist
+    # string refs resolve naturally. Data flows as a JIT argument (not a
+    # captured constant), so EXLA caches by shape only.
     logp_fn =
       if pm.size == 0 do
         constant = eval_terms(terms, %{})
-        fn _flat -> constant end
+        fn _flat, _data -> constant end
       else
-        fn flat ->
-          vm = PointMap.unpack(flat, pm)
-          eval_terms(terms, vm)
+        if has_data? do
+          fn flat, data ->
+            vm = PointMap.unpack(flat, pm)
+            vm = Map.put(vm, "__obs_data", data)
+            eval_terms(terms, vm)
+          end
+        else
+          fn flat, _data ->
+            vm = PointMap.unpack(flat, pm)
+            eval_terms(terms, vm)
+          end
         end
       end
 
     {logp_fn, pm, ncp_info}
   end
 
-  defp build_vag_fn(logp_fn, jit_opts \\ []) do
-    Exmc.JIT.jit(fn flat -> Nx.Defn.value_and_grad(flat, logp_fn) end, jit_opts)
+  defp build_vag_fn(logp_fn, obs_data, jit_opts \\ []) do
+    raw = Exmc.JIT.jit(
+      fn flat, data ->
+        Nx.Defn.value_and_grad(flat, fn f -> logp_fn.(f, data) end)
+      end,
+      jit_opts
+    )
+
+    data = obs_data || @data_sentinel
+    fn flat -> raw.(flat, data) end
   end
 
-  defp build_step_fn(logp_fn, _vag_fn, jit_opts) do
+  defp build_step_fn(logp_fn, obs_data, jit_opts) do
     fp = Exmc.JIT.precision()
 
-    jitted =
+    raw =
       Exmc.JIT.jit(
-        fn q, p, grad, eps, inv_mass ->
+        fn q, p, grad, eps, inv_mass, data ->
           two = Nx.tensor(2.0, type: fp, backend: Nx.BinaryBackend)
           half = Nx.tensor(0.5, type: fp, backend: Nx.BinaryBackend)
           half_eps = Nx.divide(eps, two)
           p_half = Nx.add(p, Nx.multiply(half_eps, grad))
           q_new = Nx.add(q, Nx.multiply(eps, Nx.multiply(inv_mass, p_half)))
-          {logp_new, grad_new} = Nx.Defn.value_and_grad(q_new, logp_fn)
+          {logp_new, grad_new} = Nx.Defn.value_and_grad(q_new, fn f -> logp_fn.(f, data) end)
           p_new = Nx.add(p_half, Nx.multiply(half_eps, grad_new))
           logp_scalar = Nx.reshape(logp_new, {})
           # Compute joint_logp = logp - 0.5 * p^T M^{-1} p inside JIT
@@ -132,9 +162,10 @@ defmodule Exmc.Compiler do
         jit_opts
       )
 
+    data = obs_data || @data_sentinel
     fn q, p, grad, epsilon, inv_mass_diag ->
       eps_t = Nx.tensor(epsilon, type: fp, backend: Nx.BinaryBackend)
-      jitted.(q, p, grad, eps_t, inv_mass_diag)
+      raw.(q, p, grad, eps_t, inv_mass_diag, data)
     end
   end
 
