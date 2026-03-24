@@ -1,5 +1,7 @@
 # eXMC
 
+> *"One does not translate a minor work. One translates the work that would not leave one alone."* — [Translator's Foreword](FOREWORD.md)
+
 **A PPL environment on the BEAM, inspired by PyMC.** eXMC is a from-scratch Elixir implementation of PyMC's architecture: declarative model specification, automatic constraint transforms, NUTS sampling, and Bayesian diagnostics — all on Nx tensors with optional EXLA acceleration.
 
 **With deep respect:** this project builds on the ideas, rigor, and ergonomics pioneered by the PyMC community. The goal is not to replace PyMC. The goal is to preserve correctness and usability while exploring what changes when the runtime is the BEAM.
