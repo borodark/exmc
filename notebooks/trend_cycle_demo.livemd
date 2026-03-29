@@ -294,17 +294,17 @@ local_level_ir =
       id: "obs_lik",
       op: {:rv, Exmc.Dist.Custom,
        %{
+         __obs_data: "__obs_data",
+         trend: "trend",
+         sigma_obs: "sigma_obs",
          __dist__: %Exmc.Dist.Custom{
            logpdf_fn: #Function<41.81571850/2 in :erl_eval.expr/6>,
            support: :real,
            transform: nil,
            sample_fn: nil
-         },
-         sigma_obs: "sigma_obs",
-         __obs_data: "__obs_data",
-         trend: "trend"
+         }
        }},
-      deps: ["sigma_obs", "__obs_data", "trend"],
+      deps: ["__obs_data", "trend", "sigma_obs"],
       shape: nil,
       dtype: nil
     },
@@ -384,9 +384,9 @@ IO.puts("sigma_obs: #{Nx.mean(trace_ll["sigma_obs"]) |> Nx.to_number() |> Float.
 
 ```
 
-11:04:45.046 [info] XLA service 0x7469a011c4a0 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+23:23:13.561 [info] XLA service 0x7e13dc018650 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
 
-11:04:45.047 [info]   StreamExecutor device (0): NVIDIA GeForce RTX 3060 Ti, Compute Capability 8.6
+23:23:13.566 [info]   StreamExecutor device (0): NVIDIA GeForce RTX 3060 Ti, Compute Capability 8.6
 Divergences: 43
 sigma_trend: 0.859
 sigma_obs: 1.121
@@ -511,14 +511,14 @@ ucsv_ir =
       id: "obs_lik",
       op: {:rv, Exmc.Dist.Custom,
        %{
+         __obs_data: "__obs_data",
+         trend: "trend",
          __dist__: %Exmc.Dist.Custom{
            logpdf_fn: #Function<41.81571850/2 in :erl_eval.expr/6>,
            support: :real,
            transform: nil,
            sample_fn: nil
          },
-         __obs_data: "__obs_data",
-         trend: "trend",
          log_vol: "log_vol"
        }},
       deps: ["__obs_data", "trend", "log_vol"],
@@ -752,13 +752,13 @@ biv_ir =
       id: "obs_lik",
       op: {:rv, Exmc.Dist.Custom,
        %{
+         __obs_data: "__obs_data",
          __dist__: %Exmc.Dist.Custom{
            logpdf_fn: #Function<41.81571850/2 in :erl_eval.expr/6>,
            support: :real,
            transform: nil,
            sample_fn: nil
          },
-         __obs_data: "__obs_data",
          trend1: "trend1",
          sigma_obs1: "sigma_obs1",
          trend2: "trend2",
@@ -893,357 +893,21 @@ trend2_init = Nx.tensor(y2_list, type: :f64)
   num_warmup: 800
 )
 
-IO.puts("Divergences: #{stats_biv.divergences}")
-IO.inspect("Stats: #{stats_biv}")
+IO.puts(": #{stats_biv.divergences}")
+# IO.inspect("Stats: #{stats_biv}")
 
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
-Divergences: 45
+: 45
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
-** (Protocol.UndefinedError) protocol String.Chars not implemented for type Map. This protocol is implemented for the following type(s): Atom, BitString, Complex, Date, DateTime, Float, Hex.Solver.Assignment, Hex.Solver.Constraints.Empty, Hex.Solver.Constraints.Range, Hex.Solver.Constraints.Union, Hex.Solver.Incompatibility, Hex.Solver.PackageRange, Hex.Solver.Term, Integer, List, NaiveDateTime, Phoenix.LiveComponent.CID, Time, URI, Version, Version.Requirement
-
-Got value:
-
-    %{
-      inv_mass_diag: #Nx.Tensor<
-        f64[244]
-        [0.04487001171787518, 0.25983004610506755, 0.09334453238067104, 0.024285546509570963, 0.41964761181331445, 0.47743430173259466, 0.4695109853952924, 0.3721221938994358, 0.4918303739610947, 0.41055017189991, 0.4194083662429078, 0.475425736081814, 0.36082617067806655, 0.3721735069058846, 0.4378856976289443, 0.448098218854323, 0.4886504893770984, 0.48166001297340655, 0.41336511136058507, 0.45500066759507446, 0.4064538604323129, 0.3552049109960974, 0.31175029685753836, 0.3491330371843031, 0.40230711508080547, 0.3362358423969651, 0.41879868883602617, 0.4126906190068507, 0.37957227945574185, 0.39482387105307043, 0.44332798989427785, 0.4485846053968549, 0.3658050687948263, 0.449552548216098, 0.42506098831820205, 0.42941931565485575, 0.47307485512484765, 0.42727104521414616, 0.3645893717028199, 0.36913268774269814, 0.39399158498751047, 0.46472626712929815, 0.43276546301938523, 0.40542337893039293, 0.434922603130475, 0.4416940533772101, 0.43509376239047043, 0.43387948791069353, 0.37679888918440885, ...]
-      >,
-      num_warmup: 800,
-      num_samples: 500,
-      step_size: 0.1431722478514991,
-      divergences: 45,
-      recoveries: 0,
-      sample_stats: [
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.932274510556149,
-          energy: 405.8934730145766,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8185717393792474,
-          energy: 411.1764366258684,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 15,
-          divergent: false,
-          accept_prob: 0.9681211046687233,
-          energy: 414.68403087541515,
-          tree_depth: 4
-        },
-        %{
-          recovered: false,
-          n_steps: 15,
-          divergent: false,
-          accept_prob: 0.6526950179501211,
-          energy: 422.41455396693834,
-          tree_depth: 4
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8784124296240032,
-          energy: 456.98258689700083,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9730890340442657,
-          energy: 472.95591717800806,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 15,
-          divergent: false,
-          accept_prob: 0.9974254708111363,
-          energy: 468.2275248206821,
-          tree_depth: 4
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.884698150396024,
-          energy: 473.803265348633,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8874936256470052,
-          energy: 498.90304076057936,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9902679205479885,
-          energy: 488.74885132042516,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9443393118322925,
-          energy: 506.1356406489873,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.962334410942438,
-          energy: 490.6551238949087,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 1.0,
-          energy: 491.49477447669335,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8801829729125578,
-          energy: 502.49131981847927,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.948413011845675,
-          energy: 516.6762611647213,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.7606265758193078,
-          energy: 521.2697432205097,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9875010150094236,
-          energy: 517.3366106682352,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9921871755033368,
-          energy: 481.6211377084031,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9831908256757799,
-          energy: 483.8916832924312,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8601767819657762,
-          energy: 492.2411677571081,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 63,
-          divergent: false,
-          accept_prob: 0.9421677009476574,
-          energy: 503.807686600687,
-          tree_depth: 6
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9053449765045758,
-          energy: 501.2049357351333,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 63,
-          divergent: false,
-          accept_prob: 0.9670178163604634,
-          energy: 498.77789277898876,
-          tree_depth: 6
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9815453158304033,
-          energy: 521.9236857774724,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9979493000509863,
-          energy: 509.3462418520594,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9988031497258639,
-          energy: 490.5690763920363,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.7955149443136059,
-          energy: 488.82056529144586,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.9603295565900135,
-          energy: 477.1914536449489,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 15,
-          divergent: false,
-          accept_prob: 0.9947333349481962,
-          energy: 429.8321976541692,
-          tree_depth: 4
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8030124197574888,
-          energy: 439.9456363137654,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8924133518204177,
-          energy: 411.0890285737307,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.4794258413770989,
-          energy: 398.61002077365174,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.876682170559534,
-          energy: 426.83018250937596,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.8364814918884558,
-          energy: 437.6479582950534,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.7631702781305126,
-          energy: 462.8168709878389,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 31,
-          divergent: false,
-          accept_prob: 0.7561473348401685,
-          energy: 481.726618813413,
-          tree_depth: 5
-        },
-        %{
-          recovered: false,
-          n_steps: 15,
-          divergent: false,
-          accept_prob: 0.9931625964147308,
-          energy: 456.42702058421816,
-          tree_depth: 4
-        },
-        %{
-          recovered: false,
-          n_steps: 15,
-          divergent: false,
-          accept_prob: 0.9936053238170414,
-          energy: 439.62053274782755,
-          ...
-        },
-        %{
-          recovered: false,
-          n_steps: 15,
-          divergent: false,
-          accept_prob: 0.945344381629954,
-          ...
-        },
-        %{recovered: false, n_steps: 31, divergent: false, ...},
-        %{recovered: false, n_steps: 15, ...},
-        %{recovered: false, ...},
-        %{...},
-        ...
-      ]
-    }
-
-    (elixir 1.18.3) lib/string/chars.ex:3: String.Chars.impl_for!/1
-    (elixir 1.18.3) lib/string/chars.ex:22: String.Chars.to_string/1
-    #cell:emgj36emxufaeg42:14: (file)
+:ok
 ```
 
 ```elixir

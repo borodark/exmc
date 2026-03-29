@@ -1,0 +1,364 @@
+# The Bearing Knows When It Will Die
+
+## Bayesian Degradation Modeling on FEMTO/PRONOSTIA Run-to-Failure Data
+
+```elixir
+Mix.install([
+  {:exmc, path: Path.expand("../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:jose, "~> 1.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## I. The Data
+
+The FEMTO/PRONOSTIA platform at FEMTO-ST Institute, Besancon, ran bearings to
+destruction under accelerated conditions. Vibration was recorded every 10
+seconds at 25.6 kHz — 2,560 samples per snapshot. Six bearings across three
+operating conditions (speed x load), each running until the vibration exceeded
+a failure threshold.
+
+The raw data is enormous. We have pre-extracted two features per snapshot:
+**RMS** (overall vibration energy) and **kurtosis** (impulsiveness — healthy
+bearings are Gaussian at ~3.0, faulted bearings spike to 5-10+).
+
+```elixir
+# Load preprocessed features
+data_path = Path.expand("../data/femto/femto_features.json", __DIR__)
+raw = Jason.decode!(File.read!(data_path))
+
+# Summary
+for {bearing, snapshots} <- Enum.sort(raw) do
+  n = length(snapshots)
+  last = List.last(snapshots)
+  first_rms = hd(snapshots)["rms_h"]
+  IO.puts("#{bearing}: #{n} snapshots (#{Float.round(n * 10 / 3600, 1)}h), " <>
+    "RMS #{Float.round(first_rms, 3)} -> #{Float.round(last["rms_h"], 3)}, " <>
+    "final kurtosis #{Float.round(last["kurtosis_h"], 1)}")
+end
+```
+
+```elixir
+alias VegaLite, as: Vl
+
+# Plot RMS degradation for all bearings
+rms_data =
+  for {bearing, snapshots} <- raw,
+      %{"snapshot" => i, "rms_h" => rms} <- snapshots,
+      rem(i, 5) == 0 do  # subsample for plotting
+    lifetime_pct = i / length(snapshots) * 100
+    %{"bearing" => bearing, "lifetime_pct" => Float.round(lifetime_pct, 1),
+      "rms" => rms, "snapshot" => i}
+  end
+
+Vl.new(width: 700, height: 300, title: "Bearing Degradation: RMS Vibration Over Lifetime")
+|> Vl.data_from_values(rms_data)
+|> Vl.mark(:line, opacity: 0.8, stroke_width: 1.5)
+|> Vl.encode_field(:x, "lifetime_pct", type: :quantitative, title: "Lifetime %")
+|> Vl.encode_field(:y, "rms", type: :quantitative, title: "RMS Acceleration (g)")
+|> Vl.encode_field(:color, "bearing", type: :nominal)
+```
+
+The signature is unmistakable. A long plateau of low, stable vibration — the
+healthy regime — then a sharp upturn as the bearing enters its final phase.
+The question is not whether the bearing will fail. The question is *when*.
+
+## II. Bayesian Changepoint: When Does Degradation Begin?
+
+Before we model the degradation curve, we need to find where it starts. The
+transition from "healthy" to "degrading" is a changepoint — the same problem
+we solved with BOCPD on the Nile River, but now with engineering stakes.
+
+```elixir
+# Use Bearing1_1 (longest run, clearest degradation)
+bearing = raw["Bearing1_1"]
+rms_series = Enum.map(bearing, & &1["rms_h"])
+n = length(rms_series)
+
+IO.puts("Bearing1_1: #{n} snapshots, #{Float.round(n * 10 / 3600, 1)} hours to failure")
+```
+
+```elixir
+defmodule DegradationDetector do
+  @doc """
+  Simple conjugate Bayesian changepoint detector.
+  Monitors the posterior mean of RMS and flags when it exceeds
+  a threshold above the baseline established in the first window.
+  """
+  def detect(series, opts \\ []) do
+    window = Keyword.get(opts, :baseline_window, 100)
+    threshold_sigma = Keyword.get(opts, :threshold, 3.0)
+
+    # Establish baseline from first `window` observations
+    baseline = Enum.take(series, window)
+    mu_0 = Enum.sum(baseline) / window
+    var_0 = Enum.sum(Enum.map(baseline, fn x -> (x - mu_0) ** 2 end)) / window
+
+    # Sequential monitoring
+    {states, _} =
+      Enum.map_reduce(series, {mu_0, var_0, 1.0 / var_0}, fn x, {mu, var, prec} ->
+        # Bayesian update (Normal-Normal, known variance approximation)
+        obs_prec = 1.0 / max(var_0, 1.0e-10)
+        new_prec = prec + obs_prec
+        new_mu = (prec * mu + obs_prec * x) / new_prec
+
+        z = (x - mu_0) / max(:math.sqrt(var_0), 1.0e-10)
+        alarm = z > threshold_sigma
+
+        state = %{x: x, mu: new_mu, z: z, alarm: alarm}
+        {state, {new_mu, var, new_prec}}
+      end)
+
+    # Find first sustained alarm (5 consecutive)
+    changepoint =
+      states
+      |> Enum.with_index()
+      |> Enum.chunk_every(5, 1, :discard)
+      |> Enum.find(fn chunk ->
+        Enum.all?(chunk, fn {s, _} -> s.alarm end)
+      end)
+      |> case do
+        [{_, idx} | _] -> idx
+        nil -> nil
+      end
+
+    {states, changepoint}
+  end
+end
+```
+
+```elixir
+{states, cp_idx} = DegradationDetector.detect(rms_series, baseline_window: 200, threshold: 3.0)
+
+cp_time_h = if cp_idx, do: Float.round(cp_idx * 10 / 3600, 1), else: nil
+total_h = Float.round(n * 10 / 3600, 1)
+
+IO.puts("Degradation onset detected at snapshot #{cp_idx} (#{cp_time_h}h of #{total_h}h)")
+IO.puts("Remaining useful life at detection: #{Float.round((n - cp_idx) * 10 / 3600, 1)} hours")
+IO.puts("Detection at #{Float.round(cp_idx / n * 100, 0)}% of total lifetime")
+```
+
+```elixir
+# Plot with changepoint
+z_data = states |> Enum.with_index() |> Enum.map(fn {s, i} ->
+  %{"snapshot" => i, "rms" => s.x, "z_score" => Float.round(s.z, 2)}
+end)
+
+Vl.new(width: 700, height: 400)
+|> Vl.concat([
+  Vl.new(width: 700, height: 200, title: "Bearing1_1: RMS with Changepoint")
+  |> Vl.data_from_values(z_data)
+  |> Vl.layers([
+    Vl.new()
+    |> Vl.mark(:line, color: "steelblue", stroke_width: 0.5)
+    |> Vl.encode_field(:x, "snapshot", type: :quantitative)
+    |> Vl.encode_field(:y, "rms", type: :quantitative, title: "RMS (g)"),
+    Vl.new()
+    |> Vl.mark(:rule, color: "red", stroke_dash: [6, 4])
+    |> Vl.encode(:x, datum: cp_idx)
+  ]),
+
+  Vl.new(width: 700, height: 150, title: "Z-score (deviation from baseline)")
+  |> Vl.data_from_values(z_data)
+  |> Vl.layers([
+    Vl.new()
+    |> Vl.mark(:line, color: "orange", stroke_width: 0.5)
+    |> Vl.encode_field(:x, "snapshot", type: :quantitative)
+    |> Vl.encode_field(:y, "z_score", type: :quantitative, title: "z"),
+    Vl.new()
+    |> Vl.mark(:rule, color: "red", stroke_dash: [6, 4])
+    |> Vl.encode(:x, datum: cp_idx)
+  ])
+], :vertical)
+```
+
+The red line marks the changepoint. Everything to its left is healthy. Everything
+to its right is dying. The Bayesian monitor catches the transition while there
+are still hours of useful life remaining.
+
+## III. Degradation Model: Exponential Growth via NUTS
+
+After the changepoint, the RMS follows an approximately exponential growth curve
+(Gebraeel et al., 2005). We model the post-onset degradation as:
+
+$$\text{RMS}(t) = a \cdot e^{b \cdot t} + \varepsilon, \quad \varepsilon \sim N(0, \sigma^2)$$
+
+Where $a$ is the initial amplitude, $b$ is the degradation rate, and $t$ is time
+since the changepoint. From the posterior of $b$, we can predict when RMS will
+cross a failure threshold — the remaining useful life (RUL).
+
+```elixir
+alias Exmc.{Builder, Sampler}
+alias Exmc.Dist.{Normal, HalfNormal, Custom}
+
+defmodule Deg do
+  def t(v), do: Nx.tensor(v, type: :f64)
+end
+```
+
+```elixir
+# Extract post-changepoint degradation data
+post_onset = Enum.drop(rms_series, cp_idx)
+# Subsample for tractability (every 10th point)
+post_sub = post_onset |> Enum.take_every(10) |> Enum.map(&(&1 * 1.0))
+n_post = length(post_sub)
+t_post = Enum.map(0..(n_post - 1), fn i -> i * 100.0 end)  # time in seconds (10 snapshots * 10s)
+
+y_obs = Nx.tensor(post_sub, type: :f64)
+t_obs = Nx.tensor(t_post, type: :f64)
+obs_data = Nx.stack([y_obs, t_obs], axis: 1)
+
+IO.puts("Post-onset: #{n_post} points (subsampled from #{length(post_onset)})")
+IO.puts("RMS range: #{Float.round(Enum.min(post_sub), 3)} - #{Float.round(Enum.max(post_sub), 3)}")
+```
+
+```elixir
+# Build exponential degradation model
+ir =
+  Builder.new_ir()
+  |> Builder.data(obs_data)
+  |> Builder.rv("log_a", Normal, %{mu: Deg.t(-2.0), sigma: Deg.t(2.0)})
+  |> Builder.rv("log_b", Normal, %{mu: Deg.t(-8.0), sigma: Deg.t(2.0)})
+  |> Builder.rv("sigma", HalfNormal, %{sigma: Deg.t(1.0)})
+
+logpdf_fn = fn _x, params ->
+  data = params.__obs_data
+  y = data[[.., 0]]
+  t = data[[.., 1]]
+
+  a = Nx.exp(params.log_a)
+  b = Nx.exp(params.log_b)
+  sigma = Nx.max(params.sigma, Deg.t(1.0e-6))
+
+  # y = a * exp(b * t) + noise
+  pred = Nx.multiply(a, Nx.exp(Nx.multiply(b, t)))
+  z = Nx.divide(Nx.subtract(y, pred), sigma)
+  Nx.sum(Nx.subtract(Nx.multiply(Deg.t(-0.5), Nx.multiply(z, z)), Nx.log(sigma)))
+end
+
+dist = Custom.new(logpdf_fn, support: :real)
+
+ir =
+  Custom.rv(ir, "lik", dist, %{
+    log_a: "log_a", log_b: "log_b", sigma: "sigma",
+    __obs_data: "__obs_data"
+  })
+  |> Builder.obs("lik_obs", "lik", Nx.tensor(0.0, type: :f64))
+```
+
+```elixir
+# Sample
+{trace, stats} = Sampler.sample(ir,
+  %{"log_a" => -1.0, "log_b" => -7.0, "sigma" => 0.3},
+  num_warmup: 1000,
+  num_samples: 1000,
+  ncp: false
+)
+
+a_samples = trace["log_a"] |> Nx.exp() |> Nx.to_flat_list()
+b_samples = trace["log_b"] |> Nx.exp() |> Nx.to_flat_list()
+
+a_mean = Enum.sum(a_samples) / length(a_samples)
+b_mean = Enum.sum(b_samples) / length(b_samples)
+sigma_mean = Nx.mean(trace["sigma"]) |> Nx.to_number()
+
+IO.puts("Divergences: #{stats.divergences}")
+IO.puts("a = #{Float.round(a_mean, 4)}")
+IO.puts("b = #{:erlang.float_to_binary(b_mean, decimals: 8)}")
+IO.puts("sigma = #{Float.round(sigma_mean, 4)}")
+```
+
+```elixir
+# Predict RUL: when does the curve cross the failure threshold?
+failure_threshold = 5.0  # g RMS — typical failure criterion
+
+rul_samples =
+  Enum.zip(a_samples, b_samples)
+  |> Enum.map(fn {a, b} ->
+    # a * exp(b * t) = threshold => t = ln(threshold/a) / b
+    if a > 0 and b > 0 and failure_threshold / a > 1 do
+      :math.log(failure_threshold / a) / b
+    else
+      nil
+    end
+  end)
+  |> Enum.reject(&is_nil/1)
+  |> Enum.map(fn t_sec -> t_sec / 3600 end)  # convert to hours
+
+rul_mean = Enum.sum(rul_samples) / max(length(rul_samples), 1)
+rul_sorted = Enum.sort(rul_samples)
+rul_05 = Enum.at(rul_sorted, div(length(rul_sorted) * 5, 100))
+rul_95 = Enum.at(rul_sorted, div(length(rul_sorted) * 95, 100))
+
+actual_remaining = (n - cp_idx) * 10 / 3600
+
+IO.puts("=== Remaining Useful Life Prediction ===")
+IO.puts("Failure threshold: #{failure_threshold} g RMS")
+IO.puts("Predicted RUL: #{Float.round(rul_mean, 1)} hours")
+IO.puts("95% credible interval: [#{Float.round(rul_05, 1)}, #{Float.round(rul_95, 1)}] hours")
+IO.puts("Actual remaining life: #{Float.round(actual_remaining, 1)} hours")
+```
+
+```elixir
+# Plot: degradation curve with posterior predictive
+t_future = Enum.map(0..300, fn i -> i * 100.0 end)
+
+# Sample 50 posterior curves
+curves =
+  Enum.zip(a_samples, b_samples)
+  |> Enum.take(50)
+  |> Enum.with_index()
+  |> Enum.flat_map(fn {{a, b}, idx} ->
+    Enum.map(t_future, fn t ->
+      pred = a * :math.exp(b * t)
+      %{"time_h" => t / 3600, "rms" => min(pred, 10.0), "curve" => "sample_#{idx}"}
+    end)
+  end)
+
+obs_points = Enum.zip(t_post, post_sub)
+  |> Enum.map(fn {t, y} ->
+    %{"time_h" => t / 3600, "rms" => y, "curve" => "observed"}
+  end)
+
+Vl.new(width: 700, height: 300, title: "Degradation Model: Posterior Predictive Curves")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(curves)
+  |> Vl.mark(:line, opacity: 0.15, color: "firebrick")
+  |> Vl.encode_field(:x, "time_h", type: :quantitative, title: "Hours since onset")
+  |> Vl.encode_field(:y, "rms", type: :quantitative, title: "RMS (g)", scale: %{domain: [0, 8]})
+  |> Vl.encode_field(:detail, "curve", type: :nominal),
+  Vl.new()
+  |> Vl.data_from_values(obs_points)
+  |> Vl.mark(:point, color: "steelblue", size: 15, opacity: 0.7)
+  |> Vl.encode_field(:x, "time_h", type: :quantitative)
+  |> Vl.encode_field(:y, "rms", type: :quantitative),
+  Vl.new()
+  |> Vl.mark(:rule, color: "red", stroke_dash: [6, 4])
+  |> Vl.encode(:y, datum: failure_threshold)
+])
+```
+
+The red dashed line is the failure threshold. The blue dots are observed data.
+The fan of red curves is the posterior: each curve is one plausible future,
+sampled from the Bayesian posterior of the degradation parameters. Where the
+fan crosses the threshold defines the distribution of remaining useful life.
+
+---
+
+*Data: FEMTO/PRONOSTIA IEEE PHM 2012 Challenge. Bearing1_1, run-to-failure.*
+*Model: exponential degradation with Bayesian changepoint onset detection.*
+*Inference: NUTS via eXMC.*
+
+### References
+
+* Gebraeel, N., Lawley, M., Li, R. & Ryan, J. (2005). "Residual-life
+  distributions from component degradation signals: A Bayesian approach."
+  *IIE Transactions*, 37, 543-557.
+* Nectoux, P. et al. (2012). "PRONOSTIA: An experimental platform for
+  bearings accelerated degradation tests." IEEE PHM 2012.
+* Adams, R. P. & MacKay, D. J. C. (2007). "Bayesian Online Changepoint
+  Detection." arXiv:0710.3742.

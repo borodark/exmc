@@ -243,6 +243,25 @@ eXMC's tensor operations go through [Nx](https://github.com/elixir-nx/nx), with 
 | [EMLX](https://github.com/elixir-nx/emlx) | Apple Silicon (Metal) | Planned. MLX backend for M-series Macs ([#1](https://github.com/borodark/exmc/issues/1)) |
 | BinaryBackend | Any | Fallback. Pure Elixir, no dependencies |
 
+## The Ecosystem: Three Inference Families
+
+eXMC is one of three standalone libraries for Bayesian inference on the BEAM.
+Each covers a different inference family. Each is independent — no shared
+dependencies beyond Elixir itself.
+
+| Library | Algorithm | For | Deps |
+|---|---|---|---|
+| **eXMC** | NUTS / HMC, ADVI, SMC, Pathfinder | Known parametric models, continuous parameters | Nx, EXLA |
+| [**smc_ex**](https://github.com/borodark/smc_ex) | Bootstrap PF, PMCMC, Online SMC² | Discrete state transitions, streaming data, epidemic tracking | **zero** |
+| [**StochTree-Ex**](https://github.com/borodark/stochtree_ex) | BART (Bayesian Additive Regression Trees) | Unknown functional form, feature discovery, nonparametric regression | Rustler |
+
+**When to use which:**
+
+- Your model has a known structure with continuous parameters → **eXMC** (NUTS)
+- Your states are discrete (SEIR, HMM, regime-switching) and data streams in → **smc_ex** (O-SMC²)
+- You don't know the functional form and want to discover which features matter → **StochTree-Ex** (BART)
+- You want all three in one application → they compose. Each is a Mix dependency with no conflicts.
+
 ## Architectural Decisions
 
 Every non-trivial choice is recorded in [`DECISIONS.md`](DECISIONS.md) with rationale, assumptions, and implications. From "why `:rand` instead of `Nx.Random`" to "why auto-NCP" to "why compile once for parallel chains."

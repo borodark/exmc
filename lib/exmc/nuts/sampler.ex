@@ -164,42 +164,54 @@ defmodule Exmc.NUTS.Sampler do
       logp = Nx.backend_copy(logp, Nx.BinaryBackend)
       grad = Nx.backend_copy(grad, Nx.BinaryBackend)
 
-      # Initialize mass matrix (identity, diagonal)
-      inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend), {d})
+      # Warm-start: reuse previous mass matrix + step size
+      warm_start = Keyword.get(opts, :warm_start)
 
       # Use generic step_fn for dense mode (dispatches on mass shape)
       active_step_fn = if use_dense, do: build_generic_step_fn(vag_fn), else: step_fn
-
-      # Find reasonable initial step size (always with diagonal identity)
-      {epsilon, rng} =
-        find_reasonable_epsilon_with_rng(active_step_fn, q, logp, grad, inv_mass_diag, rng)
-
-      # Run warmup
-      state = %{
-        q: q,
-        logp: logp,
-        grad: grad,
-        rng: rng,
-        divergences: 0,
-        recoveries: 0
-      }
 
       # Use batched leapfrog for diagonal mass (both warmup and sampling)
       active_multi = if use_dense, do: nil, else: multi_step_fn
 
       {state, epsilon, inv_mass, chol_cov} =
-        run_warmup(
-          active_step_fn,
-          state,
-          epsilon,
-          inv_mass_diag,
-          d,
-          num_warmup,
-          max_tree_depth,
-          target_accept,
-          use_dense,
-          active_multi
-        )
+        if warm_start do
+          # Warm-start: use previous mass matrix and step size.
+          # Run only a short warmup (50 iterations) for fine-tuning.
+          prev_inv_mass = Nx.backend_copy(warm_start.inv_mass_diag, Nx.BinaryBackend)
+          prev_epsilon = warm_start.step_size
+
+          state = %{
+            q: q, logp: logp, grad: grad, rng: rng,
+            divergences: 0, recoveries: 0
+          }
+
+          short_warmup = min(num_warmup, 50)
+
+          if short_warmup > 0 do
+            run_warmup(
+              active_step_fn, state, prev_epsilon, prev_inv_mass, d,
+              short_warmup, max_tree_depth, target_accept, use_dense, active_multi
+            )
+          else
+            {state, prev_epsilon, prev_inv_mass, nil}
+          end
+        else
+          # Cold start: identity mass matrix, find step size, full warmup
+          inv_mass_diag = Nx.broadcast(Nx.tensor(1.0, type: Exmc.JIT.precision(), backend: Nx.BinaryBackend), {d})
+
+          {epsilon, rng} =
+            find_reasonable_epsilon_with_rng(active_step_fn, q, logp, grad, inv_mass_diag, rng)
+
+          state = %{
+            q: q, logp: logp, grad: grad, rng: rng,
+            divergences: 0, recoveries: 0
+          }
+
+          run_warmup(
+            active_step_fn, state, epsilon, inv_mass_diag, d,
+            num_warmup, max_tree_depth, target_accept, use_dense, active_multi
+          )
+        end
 
       # Freeze step size
       epsilon_final = epsilon
