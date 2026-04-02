@@ -13,6 +13,26 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+A bearing's vibration RMS is 0.8 mm/s today. The alarm threshold is
+4.5 mm/s. When will it cross? Tomorrow? Next month? The maintenance
+window is in three weeks. Do you pull the bearing now and waste
+remaining life, or gamble that it survives until the window?
+
+The degradation curve answers this. Vibration grows exponentially in
+the final failure stage --- but the growth rate varies by bearing, load,
+speed, and lubrication. A single curve fit to this bearing's 30 days of
+data has wide uncertainty. A hierarchical model fit to 100 bearings
+narrows it: this bearing's growth rate is informed by every bearing
+that has failed before it.
+
+The output isn't "42 days remaining." It's a distribution:
+P(failure before maintenance window) = 12%. Is 12% acceptable? That
+depends on the cost of unplanned downtime ($260K/hour average in
+manufacturing) versus the cost of early replacement ($800). The model
+gives the probability. The business makes the call.
+
 ## I. The Data
 
 The FEMTO/PRONOSTIA platform at FEMTO-ST Institute, Besancon, ran bearings to

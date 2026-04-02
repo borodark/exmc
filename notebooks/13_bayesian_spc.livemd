@@ -13,6 +13,23 @@ Mix.install([
 # EXLA required — BinaryBackend gradient computation crashes on Complex.divide
 ```
 
+## Why This Matters
+
+A Shewhart control chart triggers when a point crosses the 3-sigma
+line. But 3-sigma is not a probability. It is a frequency --- "in the
+long run, 0.27% of points from an in-control process will exceed this
+limit." That answers a question about an infinite future. The operator
+has one point, right now, and needs to know: **has this process actually
+shifted, or is this just noise?**
+
+Bayesian SPC answers the actual question. The posterior probability
+of a shift --- P(mean has changed | data) --- is a number between 0 and 1
+that incorporates everything: the current observation, the process
+history, and the prior belief about how often shifts occur. A Shewhart
+chart says "alarm" or "no alarm." A Bayesian chart says "73% probability
+the process has shifted by approximately 0.4 sigma." The operator
+decides what to do with 73%. The chart doesn't decide for them.
+
 ## Overview
 
 Three Bayesian approaches to SPC, from simplest to most general:

@@ -17,6 +17,23 @@ Mix.install([
 # value_and_grad in EXLA.jit when EXLA is available.
 ```
 
+## Why This Matters
+
+Decomposing a time series into trend and cycle is not an academic
+exercise. Central banks set interest rates based on whether inflation
+is trending or cycling. Portfolio managers allocate based on whether
+a price move is structural or mean-reverting. Factory managers schedule
+based on whether demand is growing or fluctuating.
+
+Every decomposition method --- HP filter, Kalman filter, Beveridge-Nelson
+--- makes assumptions about the dynamics. A Bayesian state-space model
+makes those assumptions explicit and estimates them from data. The
+trend's smoothness, the cycle's persistence, the noise level --- all
+inferred, not assumed. And the uncertainty in the decomposition
+propagates to the forecast: when the model isn't sure whether a move
+is trend or cycle, the forecast intervals widen. Honest uncertainty,
+not false precision.
+
 ## 1. Fetch FRED Data
 
 We use three macroeconomic time series from the Federal Reserve Bank of St. Louis (FRED):

@@ -17,6 +17,24 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+A steam turbine vibrates. They all vibrate. The question is whether the
+vibration pattern reveals an imbalance mass — and if so, how large,
+at what angle, and how urgently it needs correction.
+
+The traditional approach: an experienced technician reads a spectrum
+analyzer, recognizes the 1X signature, and makes a judgment call. This
+works until the technician retires, or until you have 200 turbines
+across six plants and can't put a human in front of every spectrum.
+
+The Bayesian approach: encode the physics of rotor dynamics as a
+probabilistic model. The imbalance mass and angle are unknown
+parameters. The vibration measurements are noisy observations. NUTS
+recovers the posterior — not "the imbalance is 12 grams at 45 degrees"
+but "the imbalance is 12 ± 3 grams at 45 ± 8 degrees, and here is the
+probability it exceeds the trip threshold."
+
 ## The Jeffcott Rotor Model
 
 Every rotating machine vibrates. The dominant vibration at running speed (1X synchronous)

@@ -17,6 +17,23 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+Your data has 50 observations. The sample mean is 4.2. Is the true mean
+4.0 or 4.5? A frequentist confidence interval says "4.0 to 4.4, 95% of
+the time, in repeated sampling." That answers a question nobody asked.
+
+The question you asked: "Given the data I have, what should I believe
+about the parameter?" That's a posterior distribution. Bayesian inference
+computes it. eXMC does it on the BEAM — where inference can stream, fault-
+recover, and distribute across nodes as a consequence of the runtime,
+not as a feature bolted on.
+
+This notebook starts with the simplest case: one parameter, 50
+observations. If the posterior is wrong here, everything built on top
+of it — hierarchical models, model comparison, streaming updates — is
+wrong too. We verify against the analytical solution.
+
 ## Building a Simple Model
 
 eXMC uses an IR (intermediate representation) to define probabilistic models.

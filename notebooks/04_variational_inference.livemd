@@ -17,6 +17,28 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+NUTS gives you the exact posterior. It is also slow — 1,000 warmup
+iterations, 1,000 sampling iterations, minutes to hours on complex
+models. When you need a quick answer — a first approximation, an
+initialization point, a model check before committing to full MCMC —
+you need something faster that gives up accuracy for speed.
+
+ADVI (Automatic Differentiation Variational Inference) fits a Gaussian
+approximation to the posterior in seconds. The approximation is wrong —
+posteriors are rarely Gaussian — but it's wrong in a *useful* way: the
+mean is usually close, the variance is usually underestimated, and the
+result tells you whether the model is identifiable before you spend an
+hour running NUTS.
+
+This notebook also covers a subtlety that trips up every hierarchical
+modeler: centered vs non-centered parameterization. When data is sparse,
+the centered parameterization creates a geometry that NUTS struggles
+with — a funnel where step size can't adapt to both the narrow and wide
+ends. NCP reparameterizes to eliminate the funnel. The choice isn't
+about the model — it's about the sampler's geometry.
+
 ## NCP vs Centered Parameterization
 
 eXMC auto-applies Non-Centered Parameterization (NCP) for hierarchical models.

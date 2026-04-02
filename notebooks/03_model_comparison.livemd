@@ -17,6 +17,24 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+You built two models. Model A has three parameters. Model B has seven.
+Model B fits the training data better. Does that mean B is a better
+model? No. It means B has more knobs to turn.
+
+The question isn't "which model fits best?" It's "which model
+*predicts* best?" Prediction requires penalizing complexity — a model
+that memorizes the data it saw will fail on data it hasn't. WAIC and
+LOO-CV estimate out-of-sample predictive accuracy without holding data
+out. They measure how well your model will work tomorrow, not how well
+it explains today.
+
+Every model selection tool in frequentist statistics (AIC, BIC, cross-
+validation) approximates this same quantity. WAIC and LOO do it using
+the full posterior, not a point estimate. They use the information you
+already computed. The cost is one line of code after sampling.
+
 ## Two Competing Models
 
 We'll build two models for the same data and compare them using

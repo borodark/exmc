@@ -12,6 +12,25 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+GDP grew 0.3% last quarter. Is the economy accelerating or slowing
+down? Unemployment dropped 0.1 points. Is that a trend or a blip?
+Inflation rose 0.2 points. Transitory or persistent?
+
+Every macroeconomic indicator blends signal and noise. The signal is
+a latent state --- the "true" trend that moves slowly and the cycle
+that oscillates around it. The noise is measurement error, seasonal
+adjustment artifacts, and revisions. You can't observe the signal
+directly. You observe a noisy function of it, one quarter at a time.
+
+A state-space model separates them. The latent states evolve according
+to transition dynamics (random walk, AR, trend+cycle). The observations
+are noisy projections. NUTS recovers the posterior over the entire
+latent trajectory --- not "the trend is 2.1%" but "the trend is 2.1%
+with 90% credible interval [1.8%, 2.4%], and here is the probability
+the cycle has turned."
+
 ## The Recipe
 
 Every state-space model in eXMC follows four steps:

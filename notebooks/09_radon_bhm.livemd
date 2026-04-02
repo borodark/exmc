@@ -17,6 +17,28 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+Radon kills 21,000 Americans per year. It seeps from uranium in the
+soil into basements. Some counties have high radon; some don't. The
+EPA needs to know which.
+
+The problem: most counties have fewer than five measurements. A county
+with two readings of 4.1 and 1.2 pCi/L — what is the true mean? The
+sample mean (2.65) has a standard error larger than itself. Useless.
+
+But we know something the sample mean doesn't: counties with high
+uranium tend to have high radon. And nearby counties tend to be
+similar. A hierarchical model with uranium as a county-level predictor
+borrows strength from geology. The county with two measurements gets
+an estimate informed by 919 counties' worth of data. The result isn't
+a guess — it's optimal in the mean squared error sense. Stein showed
+this in 1956. The hierarchical model implements it.
+
+This is the canonical Bayesian hierarchical example — Gelman & Hill's
+radon dataset. If your framework can't do this, it can't do applied
+statistics.
+
 ## The Radon Model
 
 The **radon varying-intercept model** is the "MNIST of Bayesian hierarchical models" —

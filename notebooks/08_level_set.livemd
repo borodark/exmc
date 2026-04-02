@@ -14,6 +14,21 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+You are drilling a borehole. Somewhere below the surface is a boundary
+— intact rock on one side, a fault or void on the other. You can't see
+it. You can only measure indirect signals: seismic reflections, gravity
+anomalies, resistivity profiles. Each measurement constrains the
+boundary's location, but none pins it down.
+
+The level set method represents this boundary as the zero contour of a
+continuous function. Bayesian inference over the level set function
+gives you not a best-guess boundary, but a distribution of plausible
+boundaries — each consistent with the measurements, each telling a
+different story about what lies beneath. The spread of those boundaries
+is the honest answer to "how well do we know where the fault is?"
+
 ```elixir
 alias VegaLite, as: Vl
 alias Exmc.{Builder, NUTS.Sampler, Dist}

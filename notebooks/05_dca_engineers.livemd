@@ -17,6 +17,25 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+An oil well's production declines over time. How fast? The answer
+determines whether the field is worth $50 million or $200 million.
+The traditional approach: fit an Arps decline curve to 12 months of
+production data, extrapolate 30 years, report a single EUR (Estimated
+Ultimate Recovery). The board makes a $100 million development decision
+based on that one number.
+
+The problem: 12 months of noisy data admits many plausible decline
+curves. The exponential fit says 2 million barrels. The hyperbolic
+says 3.5 million. Both fit the data equally well. Which one do you
+report?
+
+Neither. You report the posterior distribution over decline parameters,
+integrated into a predictive distribution over future production. Not
+one EUR — a distribution of EURs, with probability masses on the
+outcomes that matter: P(EUR > 2M), P(EUR > 3M), P(breakeven).
+
 ## The Arps Decline Model
 
 Every producing oil or gas well declines over time. The **Arps hyperbolic decline** equation

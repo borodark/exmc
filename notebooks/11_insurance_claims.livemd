@@ -17,6 +17,26 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+An insurer has 12 business segments. Two are mature with 10,000 claims
+each. Three are new with fewer than 50. The actuary must set reserves
+for all twelve.
+
+The mature segments have stable claim rates --- use their own data. The
+new segments have volatile rates --- a few bad months skew everything.
+Setting reserves from 50 observations is gambling. Setting them from
+the company average ignores that segment-specific risk factors exist.
+
+A hierarchical model does both: each segment gets its own rate, but
+the rates are drawn from a common distribution. The new segment with
+50 claims borrows stability from the company's total experience. The
+mature segment with 10,000 claims barely moves --- its data dominates
+its prior. The posterior gives the actuary not "the claim rate is
+3.2%" but "the claim rate is 3.2% with 90% probability between 2.1%
+and 4.8%." That range is the difference between adequate reserves and
+a surprise call from the regulator.
+
 ## The Insurance Claims Model
 
 **Hierarchical Poisson frequency models** are standard in actuarial science for estimating

@@ -50,6 +50,25 @@ Mix.install([
 :ok
 ```
 
+## Why This Matters
+
+You have eight schools. Each ran the same program. Each measured an
+effect. School A saw +28 points. School G saw -1. Do you report each
+school's number individually? Average them? Neither is right.
+
+Reporting individually ignores that the schools are similar — they ran
+the same program. Averaging ignores that the schools are different —
+they have different students, teachers, and contexts. You need both:
+a model that learns from each school while borrowing strength from all
+of them.
+
+That's a hierarchical model. Partial pooling. The small school with 15
+students borrows information from the large school with 500. The result
+is better than either the individual estimate or the grand mean — for
+every school. This is not a statistical trick. It is Bayes' theorem
+applied to structured data, and it is the single most useful model in
+applied statistics.
+
 ## Building a Hierarchical Model
 
 Hierarchical models have parameters that depend on other parameters.

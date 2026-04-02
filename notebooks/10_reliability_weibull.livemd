@@ -17,6 +17,26 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+You shipped 1,000 units. After 12 months, 47 have failed. The rest
+are still running. What is the failure rate? When should you expect the
+next warranty claim wave?
+
+A naive estimate: 47/1000 = 4.7% failure rate. This ignores the 953
+units that haven't failed *yet* --- they carry information too. Their
+survival is evidence that the failure rate isn't as high as the early
+failures suggest. Ignoring them biases every estimate upward.
+
+Survival analysis handles this through censoring: units still running
+are right-censored observations. The Weibull model captures the shape
+of the failure curve --- increasing hazard (wear-out), decreasing hazard
+(infant mortality), or constant (random failures). A hierarchical
+Weibull pools across component types, so a new product with 5 failures
+borrows from the fleet's 500. The posterior over shape and scale gives
+you P(failure before 24 months) --- the number the warranty department
+actually needs.
+
 ## The Reliability Model
 
 **Hierarchical Weibull reliability** models failure times across component types with

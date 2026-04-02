@@ -13,6 +13,26 @@ Mix.install([
 ])
 ```
 
+## Why This Matters
+
+You manage 100 turbofan engines. Engine #47 has 15,000 hours. How many
+hours until it needs overhaul? The manufacturer's spec says 25,000.
+But engine #47 runs hotter than average, at a different altitude, with
+a different maintenance history.
+
+Engine #23 failed at 22,000 hours. Engine #61 is at 28,000 and
+counting. Each engine's trajectory tells part of the story. A
+hierarchical model tells the whole story: every engine informs every
+other engine, weighted by similarity of operating conditions. Engine
+#47 borrows degradation knowledge from the engines that have already
+failed and from those still running (right-censored observations that
+constrain the upper tail).
+
+The result: a fleet-level RUL (Remaining Useful Life) forecast. Not
+one number per engine --- a distribution. Schedule overhauls where
+P(failure before next window) exceeds your risk tolerance. The fleet
+posterior makes this decision for 100 engines simultaneously.
+
 ## I. The Fleet
 
 NASA's Commercial Modular Aero-Propulsion System Simulation (C-MAPSS) models
