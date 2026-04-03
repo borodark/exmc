@@ -29,3 +29,4 @@ deps/exla/cache/*
 
 # Machine-specific CUDA libdevice symlink for XLA
 /cuda_sdk_lib/
+/data/*
