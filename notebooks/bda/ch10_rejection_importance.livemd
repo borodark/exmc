@@ -1,0 +1,436 @@
+# BDA Chapter 10 — Rejection and Importance Sampling
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Before NUTS, before Gibbs, before anyone wrote a PPL, there were two
+algorithms that computed expectations under intractable distributions:
+**rejection sampling** and **importance sampling**. They were the entire
+toolbox in the 1950s. They are still useful today — particle filters are
+sequential importance sampling with resampling, and rejection sampling is
+the building block of every "exact" sampler for distributions with
+bounded support.
+
+This chapter implements both **from scratch in pure Elixir**. The lesson is
+not "Elixir can do this" — every language can. The lesson is **what they
+do under the hood**: how the proposal distribution shapes everything,
+why the methods fail in high dimensions, and what assumptions are
+hiding in `Sampler.sample/3` calls you make in other notebooks.
+
+If you've ever wondered "what is NUTS actually doing?" you should
+implement rejection sampling first. It will not survive contact with
+high-dimensional reality, and the way it dies will tell you exactly what
+NUTS had to invent to get past it.
+
+## A Toy Target
+
+We need an interesting target distribution `q(θ)` that is **not** something
+we already know how to sample from. The classic trick: take a small set of
+points and define `q` as a kernel density estimate over them. We don't
+have scipy, so we'll use a hand-rolled mixture of three Gaussians that has
+two bumps and is mildly asymmetric — the kind of distribution where naive
+methods fail in interesting ways.
+
+```elixir
+defmodule Target do
+  @moduledoc """
+  A funky target: mixture of three Gaussians. Bimodal, asymmetric. The kind
+  of thing that defeats naive samplers.
+  """
+
+  @components [
+    {0.5, -0.8, 0.45},
+    {0.3, 0.6, 0.30},
+    {0.2, 1.7, 0.50}
+  ]
+
+  def pdf(x) do
+    Enum.reduce(@components, 0.0, fn {w, mu, sigma}, acc ->
+      acc + w * normal_pdf(x, mu, sigma)
+    end)
+  end
+
+  defp normal_pdf(x, mu, sigma) do
+    z = (x - mu) / sigma
+    1.0 / (sigma * :math.sqrt(2 * :math.pi())) * :math.exp(-0.5 * z * z)
+  end
+end
+```
+
+```elixir
+xs = Nx.linspace(-3.0, 3.0, n: 200) |> Nx.to_list()
+target_curve = Enum.map(xs, fn x -> %{x: x, density: Target.pdf(x)} end)
+
+Vl.new(width: 600, height: 240, title: "Target distribution q(θ)")
+|> Vl.data_from_values(target_curve)
+|> Vl.mark(:area, color: "#4c78a8", opacity: 0.5)
+|> Vl.encode_field(:x, "x", type: :quantitative)
+|> Vl.encode_field(:y, "density", type: :quantitative)
+```
+
+A bimodal asymmetric blob. The naive way to draw samples from it would be
+to invert its CDF — but we don't have a closed-form CDF, only the unnormalized
+density. The two methods in this chapter are the canonical answers to that
+exact problem.
+
+## Method 1 — Rejection Sampling
+
+### The Idea
+
+Pick a proposal distribution `g(θ)` you *can* sample from. Find a constant
+`M` so that `M·g(θ) ≥ q(θ)` for all `θ`. Now `M·g(θ)` is an "envelope"
+that completely covers your target.
+
+To draw a sample:
+
+1. Sample `θ ~ g(θ)`.
+2. Sample `u ~ Uniform(0, 1)`.
+3. Accept `θ` if `u ≤ q(θ) / (M · g(θ))`. Otherwise, throw it away and try again.
+
+The accepted samples are exactly distributed according to `q(θ)`. There
+is no approximation, no autocorrelation, no warmup. The cost is the
+**rejection rate** — if `M·g(θ)` is much larger than `q(θ)` over much of
+the support, you spend most of your time throwing away samples.
+
+The art of rejection sampling is choosing a proposal that is easy to
+sample from but tightly bounds the target. For our bimodal target, a
+Normal proposal centered between the bumps is a reasonable first try.
+
+### Implementation
+
+```elixir
+defmodule Rejection do
+  @doc """
+  Rejection sampling from an arbitrary target. Returns `n_target` accepted
+  samples plus a tally of total proposals (so you can compute acceptance rate).
+  """
+  def sample(n_target, target_pdf, proposal_sampler, proposal_pdf, m, rng) do
+    do_sample(n_target, target_pdf, proposal_sampler, proposal_pdf, m, rng, [], 0)
+  end
+
+  defp do_sample(0, _, _, _, _, rng, acc, total),
+    do: {Enum.reverse(acc), total, rng}
+
+  defp do_sample(remaining, q, sampler, g, m, rng, acc, total) do
+    {theta, rng} = sampler.(rng)
+    {u, rng} = :rand.uniform_s(rng)
+    accept_ratio = q.(theta) / (m * g.(theta))
+
+    if u <= accept_ratio do
+      do_sample(remaining - 1, q, sampler, g, m, rng, [theta | acc], total + 1)
+    else
+      do_sample(remaining, q, sampler, g, m, rng, acc, total + 1)
+    end
+  end
+end
+```
+
+### Choosing M
+
+We need `M` such that `q(θ) ≤ M·g(θ)` for all `θ`. The cheap way: evaluate
+`q(θ) / g(θ)` on a fine grid and take the maximum.
+
+```elixir
+proposal_mu = 0.0
+proposal_sigma = 1.1
+
+g = fn x ->
+  z = (x - proposal_mu) / proposal_sigma
+  1.0 / (proposal_sigma * :math.sqrt(2 * :math.pi())) * :math.exp(-0.5 * z * z)
+end
+
+ratios = Enum.map(xs, fn x -> Target.pdf(x) / g.(x) end)
+m_const = Enum.max(ratios) * 1.05
+
+# Add 5% padding so we don't squeeze the envelope
+%{
+  proposal: "Normal(#{proposal_mu}, #{proposal_sigma})",
+  M: Float.round(m_const, 3),
+  expected_acceptance_rate: Float.round(1.0 / m_const, 3)
+}
+```
+
+The expected acceptance rate is `1 / M`. If `M` is 2, you keep half your
+proposals. If `M` is 10, you keep 10%. Higher dimensions make this much
+worse — we'll see why shortly.
+
+### Run It
+
+```elixir
+proposal_sampler = fn rng ->
+  {z, rng} = :rand.normal_s(rng)
+  {proposal_mu + proposal_sigma * z, rng}
+end
+
+seed_state = :rand.seed_s(:exsss, 42)
+n_want = 1_000
+
+{rejection_samples, total_proposals, _} =
+  Rejection.sample(n_want, &Target.pdf/1, proposal_sampler, g, m_const, seed_state)
+
+actual_acceptance = n_want / total_proposals
+
+%{
+  accepted: n_want,
+  total_proposals: total_proposals,
+  acceptance_rate: Float.round(actual_acceptance, 3),
+  expected: Float.round(1.0 / m_const, 3)
+}
+```
+
+The actual acceptance rate should agree with `1/M` to within a few percent
+(it converges as `n_target → ∞`).
+
+```elixir
+sample_data = Enum.map(rejection_samples, fn x -> %{x: x} end)
+
+envelope_data =
+  Enum.map(xs, fn x ->
+    %{x: x, target: Target.pdf(x), envelope: m_const * g.(x)}
+  end)
+
+env_long =
+  Enum.flat_map(envelope_data, fn d ->
+    [
+      %{x: d.x, density: d.target, kind: "target q(θ)"},
+      %{x: d.x, density: d.envelope, kind: "envelope M·g(θ)"}
+    ]
+  end)
+
+curves =
+  Vl.new(width: 600, height: 320, title: "Target, envelope, and rejection samples")
+  |> Vl.layers([
+    Vl.new()
+    |> Vl.data_from_values(env_long)
+    |> Vl.mark(:line, stroke_width: 2)
+    |> Vl.encode_field(:x, "x", type: :quantitative)
+    |> Vl.encode_field(:y, "density", type: :quantitative)
+    |> Vl.encode_field(:color, "kind", type: :nominal),
+    Vl.new()
+    |> Vl.data_from_values(sample_data)
+    |> Vl.mark(:tick, color: "#54a24b", thickness: 1)
+    |> Vl.encode_field(:x, "x", type: :quantitative)
+  ])
+
+curves
+```
+
+The blue line is the target. The orange line is the envelope. The green
+ticks at the bottom are the accepted samples. **Most of the area between
+the target and the envelope is wasted work** — every time the algorithm
+proposes a θ in that gap, it gets rejected.
+
+### Why This Fails in High Dimensions
+
+The envelope volume in `d` dimensions grows as roughly `M^d`. To keep `M`
+manageable in 10 dimensions, the proposal would have to be implausibly
+close to the target. In 100 dimensions, no fixed proposal will do — the
+acceptance rate falls off a cliff.
+
+**The first thing every advanced sampler had to fix.** Markov chain methods
+don't sample independently from a static envelope; they walk the local
+geometry. That's the entire reason MCMC exists.
+
+## Method 2 — Importance Sampling
+
+### The Idea
+
+Drop the envelope entirely. We don't need to *sample* from `q` at all —
+we only need to compute *expectations* under it. Importance sampling
+exploits the identity
+
+$$
+\mathbb{E}_q[f(\theta)] \;=\; \int f(\theta)\, q(\theta)\, d\theta
+\;=\; \int f(\theta)\, \tfrac{q(\theta)}{g(\theta)}\, g(\theta)\, d\theta
+\;=\; \mathbb{E}_g\!\left[f(\theta)\, w(\theta)\right]
+$$
+
+where `w(θ) = q(θ) / g(θ)` is the **importance weight**. So:
+
+1. Sample `θ_1, …, θ_S` from any proposal `g`.
+2. Compute weights `w_s = q(θ_s) / g(θ_s)`.
+3. Estimate `E_q[f] ≈ Σ w_s f(θ_s) / Σ w_s` (normalized) or
+   `(1/S) Σ w_s f(θ_s)` (unnormalized, only valid if `q` and `g` are both
+   normalized).
+
+No rejection. No envelope. **Every sample contributes**, weighted by how
+much the proposal under-represented (or over-represented) it.
+
+### Implementation
+
+```elixir
+defmodule Importance do
+  @doc """
+  Importance sampling. Returns `{samples, weights, ess}`. ESS is the
+  effective sample size — a diagnostic. ESS << n means the proposal is bad.
+  """
+  def sample(n, target_pdf, proposal_sampler, proposal_pdf, rng) do
+    {pairs, _} =
+      Enum.reduce(1..n, {[], rng}, fn _, {acc, rng} ->
+        {theta, rng} = proposal_sampler.(rng)
+        w = target_pdf.(theta) / proposal_pdf.(theta)
+        {[{theta, w} | acc], rng}
+      end)
+
+    pairs = Enum.reverse(pairs)
+    samples = Enum.map(pairs, &elem(&1, 0))
+    weights = Enum.map(pairs, &elem(&1, 1))
+
+    # Effective sample size (Kong 1992): ESS = (Σw)² / Σw²
+    sum_w = Enum.sum(weights)
+    sum_w2 = Enum.reduce(weights, 0.0, &(&1 * &1 + &2))
+    ess = sum_w * sum_w / sum_w2
+
+    {samples, weights, ess}
+  end
+end
+```
+
+### Run It
+
+```elixir
+seed_state = :rand.seed_s(:exsss, 7)
+
+{is_samples, is_weights, is_ess} =
+  Importance.sample(1_000, &Target.pdf/1, proposal_sampler, g, seed_state)
+
+# Estimate the mean of θ under q using importance weights
+sum_w = Enum.sum(is_weights)
+mean_estimate = (is_samples |> Enum.zip(is_weights) |> Enum.map(fn {x, w} -> x * w end) |> Enum.sum()) / sum_w
+
+# Compare to a baseline mean computed from rejection samples (gold standard for this target)
+rej_mean = Enum.sum(rejection_samples) / length(rejection_samples)
+
+%{
+  importance_mean_of_theta: Float.round(mean_estimate, 4),
+  rejection_mean_of_theta: Float.round(rej_mean, 4),
+  effective_sample_size: Float.round(is_ess, 1),
+  total_samples: 1_000,
+  efficiency: Float.round(is_ess / 1_000, 3)
+}
+```
+
+The importance and rejection estimates of `E_q[θ]` should agree to a few
+percent. The ESS tells you the cost: 1000 importance samples might be
+worth only ~600 effective samples because the proposal is under-weighting
+the bumps.
+
+### Why This Fails in High Dimensions
+
+Same reason rejection fails. The weight ratio `q/g` blows up exponentially
+in `d` when the proposal is even slightly mismatched. A few samples
+acquire huge weights and dominate the estimate; ESS collapses to ~1.
+Sequential importance sampling with resampling (particle filters) was
+invented to fight this. NUTS sidesteps it entirely by walking the local
+geometry.
+
+```elixir
+weight_data = Enum.map(is_weights, fn w -> %{weight: w} end)
+
+Vl.new(width: 600, height: 240, title: "Distribution of importance weights")
+|> Vl.data_from_values(weight_data)
+|> Vl.mark(:bar, color: "#54a24b", opacity: 0.7)
+|> Vl.encode_field(:x, "weight",
+  type: :quantitative,
+  bin: %{maxbins: 40},
+  title: "w_s = q(θ_s) / g(θ_s)"
+)
+|> Vl.encode_field(:y, "weight", type: :quantitative, aggregate: :count)
+```
+
+Look at the right tail. A few weights are much larger than the rest.
+Those samples dominate the estimate. If the right tail were *very* heavy
+— a few samples carrying most of the weight — the estimate would have
+high variance even with 1000 draws.
+
+## What This Tells You
+
+- **Rejection sampling is exact** but wastes work proportional to the
+  envelope-to-target ratio. Beautiful in 1D, useless in 100D.
+- **Importance sampling avoids rejection** but pays in weight variance.
+  ESS is the diagnostic — small ESS means the proposal is too far from
+  the target.
+- **Both methods are decoupled from any Markov chain.** No autocorrelation,
+  no warmup, no burn-in. They just need a proposal that covers the target.
+- **Both methods scale to dimensions where the proposal can be matched.**
+  In low-D, with a good proposal, they beat MCMC. The issue is finding
+  that proposal in high-D, which is exactly what variational inference
+  and adaptive importance sampling try to learn.
+- **Both methods are still in active use.** Particle filters are
+  sequential importance sampling with periodic resampling. Pareto-smoothed
+  importance sampling (PSIS-LOO) is how Bayesian model comparison works
+  in eXMC and Stan today.
+
+## Study Guide
+
+1. **Tighten the rejection envelope.** Try `proposal_sigma = 0.9` instead
+   of 1.1. What's the new `M`? What's the new acceptance rate? Plot the
+   result.
+
+2. **Loosen the rejection envelope.** Try `proposal_sigma = 2.0`. The
+   envelope is now much higher than the target everywhere. Acceptance
+   drops. What does this teach you about proposal-target matching?
+
+3. **Use a Student-t proposal** (heavier tails) for importance sampling.
+   Compare ESS to the Normal proposal. Which proposal is better for the
+   bimodal target? Why?
+
+4. **Add a second dimension.** Make the target a 2D mixture of Gaussians
+   and the proposal a 2D Normal. Compute the rejection acceptance rate.
+   Report it. Compare to the 1D case.
+
+5. **Estimate `P(θ > 1 | q)` from importance samples.** Use the formula
+   `Σ w_s · 1[θ_s > 1] / Σ w_s`. Compare to the same probability computed
+   from the rejection samples.
+
+6. **(Hard.)** Implement self-normalized importance sampling for the
+   bioassay posterior from Ch 3. Use a Laplace approximation
+   (Ch 4) as the proposal. Estimate `E[β | y]`. Compare to the grid
+   estimate.
+
+## Literature
+
+- **Gelman et al.** *Bayesian Data Analysis*, 3rd ed., §10.4-10.5
+  (rejection and importance sampling).
+- **Robert, C. & Casella, G.** *Monte Carlo Statistical Methods*, 2nd
+  ed., chapters 2-3. The mathematical reference.
+- **Kong, A. (1992).** "A note on importance sampling using
+  standardized weights." *University of Chicago Tech Report 348* — the
+  ESS formula.
+- **Vehtari, A., Gelman, A., Gabry, J. (2017).** "Pareto smoothed
+  importance sampling." [arXiv:1507.02646](https://arxiv.org/abs/1507.02646)
+  — modern stabilization of importance sampling, used in PSIS-LOO.
+- **Original Python demos:** `bda-ex-demos/demos_ch10/demo10_{1,2}.ipynb`.
+
+### Where to Go Next
+
+- `notebooks/bda/ch11_gibbs_metropolis.livemd` — when proposals can't
+  match the target globally, walk the local geometry instead. The
+  Markov chain answer.
+- `notebooks/03_model_comparison.livemd` — eXMC's WAIC/LOO uses Pareto
+  smoothed importance sampling (the modern version of importance
+  sampling) to compare models.
+- `notebooks/04_variational_inference.livemd` — variational inference
+  is "find the best proposal automatically and use it for importance
+  sampling with weight 1," approximately.

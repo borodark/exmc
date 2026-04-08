@@ -1,0 +1,385 @@
+# BDA Chapter 6 — Posterior Predictive Checks
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+You fit a model. You see the posterior. The posterior says the parameters
+live in a particular range. So far, so Bayesian. The question that makes
+you a *useful* Bayesian instead of an arrogant one:
+
+> If my model were correct, would the data look like the data I actually saw?
+
+That is the **posterior predictive check** (PPC). Procedure:
+
+1. Draw parameter samples from the posterior.
+2. For each draw, simulate a synthetic dataset of the same size.
+3. Compute a **test statistic** `T` on each synthetic dataset and on the
+   real dataset.
+4. Compare. If the real `T(y)` falls in the bulk of the simulated
+   `T(y_rep)` distribution, the model is consistent with the data on
+   that dimension. If it falls in the tail, the model is missing
+   something.
+
+The deep question — and the source of every PPC pitfall — is **which test
+statistic**. Some test statistics are useless (a tautology, fitting to
+itself). Some are devastating (a tight diagnostic of model misfit).
+Picking well is the entire skill.
+
+This chapter walks the canonical Newcomb example from Ch 3. The normal
+model fit to Newcomb's light-speed data is wrong — there are two outliers
+that the Gaussian tails can't accommodate. PPCs **detect this misfit
+under one test statistic and miss it under another**. The lesson is which
+one to use, and why.
+
+## The Data and the Model
+
+```elixir
+# Newcomb's light-speed measurements (BDA3 p. 66)
+y = [
+  28, 26, 33, 24, 34, -44, 27, 16, 40, -2,
+  29, 22, 24, 21, 25, 30, 23, 29, 31, 19,
+  24, 20, 36, 32, 36, 28, 25, 21, 28, 29,
+  37, 25, 28, 26, 30, 32, 36, 26, 30, 22,
+  36, 23, 27, 27, 28, 27, 31, 27, 26, 33,
+  26, 32, 32, 24, 39, 28, 24, 25, 32, 25,
+  29, 27, 28, 29, 16, 23
+]
+
+n = length(y)
+y_mean = Enum.sum(y) / n
+y_var = Enum.reduce(y, 0, fn v, acc -> acc + (v - y_mean) ** 2 end) / (n - 1)
+y_min = Enum.min(y)
+y_max = Enum.max(y)
+
+%{
+  n: n,
+  sample_mean: Float.round(y_mean, 2),
+  sample_variance: Float.round(y_var, 2),
+  sample_min: y_min,
+  sample_max: y_max
+}
+```
+
+The observed minimum is `-44`. Hold onto that number — it's the diagnostic
+that rejects the normal model.
+
+We fit the same Normal-inverse-χ² model from Ch 3. The posterior
+predictive distribution for a new observation is
+
+$$
+p(\tilde y \mid y) \;=\; t_{n-1}\!\left(\bar y, \, s\sqrt{1 + \tfrac{1}{n}}\right)
+$$
+
+(Student-t in `ỹ`, even though the sampling model is normal — this is
+because we integrated out the unknown `σ²`).
+
+## Posterior Predictive Replications
+
+To run PPCs, we draw the joint posterior `(μ, σ²)` and then for each draw
+simulate a full dataset of `n` observations.
+
+```elixir
+defmodule SampleInvChi2 do
+  def sample(nu, s2, rng) do
+    {chi2, rng} =
+      Enum.reduce(1..nu, {0.0, rng}, fn _, {acc, rng} ->
+        {z, rng} = :rand.normal_s(rng)
+        {acc + z * z, rng}
+      end)
+
+    {nu * s2 / chi2, rng}
+  end
+end
+```
+
+```elixir
+nrep = 1_000
+
+seed_state = :rand.seed_s(:exsss, 42)
+
+{replications, _} =
+  Enum.reduce(1..nrep, {[], seed_state}, fn _, {acc, rng} ->
+    # Draw posterior (μ, σ²)
+    {sigma2, rng} = SampleInvChi2.sample(n - 1, y_var, rng)
+    sigma = :math.sqrt(sigma2)
+    {z, rng} = :rand.normal_s(rng)
+    mu = y_mean + sigma / :math.sqrt(n) * z
+
+    # Simulate one replicated dataset of n points from N(μ, σ)
+    {yrep, rng} =
+      Enum.reduce(1..n, {[], rng}, fn _, {ys, rng} ->
+        {z, rng} = :rand.normal_s(rng)
+        {[mu + sigma * z | ys], rng}
+      end)
+
+    {[%{mu: mu, sigma: sigma, yrep: yrep} | acc], rng}
+  end)
+
+replications = Enum.reverse(replications)
+length(replications)
+```
+
+We now have **1000 simulated datasets**. Each is an `n`-point sample from
+a normal distribution whose parameters were drawn from the joint
+posterior. Under the model, these are exchangeable with the real data.
+The PPC compares them.
+
+## Test Statistic 1 — Sample Variance (the bad choice)
+
+Use `T(y) = sample variance`. Compare the variance of each replicated
+dataset to the variance of the real data.
+
+```elixir
+real_var = y_var
+
+variance_data =
+  Enum.map(replications, fn rep ->
+    yrep_mean = Enum.sum(rep.yrep) / n
+    v = Enum.reduce(rep.yrep, 0, fn vv, a -> a + (vv - yrep_mean) ** 2 end) / (n - 1)
+    %{T: v}
+  end)
+
+p_value_var =
+  Enum.count(variance_data, &(&1.T <= real_var)) / nrep
+
+%{
+  observed_T: Float.round(real_var, 2),
+  rep_T_mean: variance_data |> Enum.map(& &1.T) |> Enum.sum() |> Kernel./(nrep) |> Float.round(2),
+  posterior_predictive_p_value: Float.round(p_value_var, 3)
+}
+```
+
+The PPC p-value is **near 0.5**. The model passes this check with flying
+colors. But you already know the model is wrong (the two negative values
+prove it). What happened?
+
+The sample variance is **too closely tied to the parameter being fit**.
+The model has `σ²` as a free parameter; its posterior is centered at the
+sample variance by construction. So the predictive distribution of the
+*replicated* sample variance is also centered there. This is the test
+statistic equivalent of asking the suspect to verify his own alibi. He
+will always agree.
+
+```elixir
+real_marker = [%{T: real_var}]
+
+Vl.new(width: 600, height: 280, title: "Sample variance — useless test statistic (p ≈ 0.5)")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(variance_data)
+  |> Vl.mark(:bar, color: "#4c78a8", opacity: 0.7)
+  |> Vl.encode_field(:x, "T",
+    type: :quantitative,
+    bin: %{maxbins: 30},
+    title: "Variance of replicated dataset"
+  )
+  |> Vl.encode_field(:y, "T", type: :quantitative, aggregate: :count),
+  Vl.new()
+  |> Vl.data_from_values(real_marker)
+  |> Vl.mark(:rule, color: "#e45756", stroke_width: 3)
+  |> Vl.encode_field(:x, "T", type: :quantitative)
+])
+```
+
+The red line (real data variance) sits squarely in the bulk of the blue
+histogram (replicated variances). The PPC says "model fits." It's wrong.
+
+## Test Statistic 2 — Sample Minimum (the good choice)
+
+Now use `T(y) = min(y)`. The minimum is *not* a parameter being fit. It's
+a feature of the data the model could fail to reproduce.
+
+```elixir
+min_data =
+  Enum.map(replications, fn rep ->
+    %{T: Enum.min(rep.yrep)}
+  end)
+
+p_value_min =
+  Enum.count(min_data, &(&1.T <= y_min)) / nrep
+
+%{
+  observed_T: y_min,
+  rep_T_mean: min_data |> Enum.map(& &1.T) |> Enum.sum() |> Kernel./(nrep) |> Float.round(2),
+  rep_T_min: min_data |> Enum.map(& &1.T) |> Enum.min() |> Float.round(2),
+  posterior_predictive_p_value: Float.round(p_value_min, 4)
+}
+```
+
+The PPC p-value is **near zero**. The model would essentially never produce
+a minimum as small as `-44` from a Gaussian fit centered at ~26 with
+`σ ≈ 11`. The check rejects the model.
+
+```elixir
+real_min_marker = [%{T: y_min}]
+
+Vl.new(width: 600, height: 280, title: "Sample minimum — devastating test statistic (p ≈ 0)")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(min_data)
+  |> Vl.mark(:bar, color: "#54a24b", opacity: 0.7)
+  |> Vl.encode_field(:x, "T",
+    type: :quantitative,
+    bin: %{maxbins: 30},
+    title: "Minimum of replicated dataset"
+  )
+  |> Vl.encode_field(:y, "T", type: :quantitative, aggregate: :count),
+  Vl.new()
+  |> Vl.data_from_values(real_min_marker)
+  |> Vl.mark(:rule, color: "#e45756", stroke_width: 3)
+  |> Vl.encode_field(:x, "T", type: :quantitative)
+])
+```
+
+The red line is far in the left tail of the histogram. **No replication
+under the model produces an observation as extreme as -44.** The model is
+ruled out.
+
+The fix is the same one Ch 3 §2 hinted at: replace `Normal(μ, σ)` with
+`StudentT(ν, μ, σ)`. Heavy tails will absorb the negative outliers without
+distortion. Run the same PPC on the Student-t fit and the minimum p-value
+should rise into the bulk of the histogram.
+
+## A Cautionary PPC — Sequential Dependence
+
+A classic mistake: the model assumes observations are independent and
+identically distributed (iid). The data might have time-correlation that
+invalidates the iid assumption. To detect this, use a test statistic
+**sensitive to ordering** — like the lag-1 autocorrelation.
+
+```elixir
+defmodule TestStat do
+  @doc """
+  Lag-1 autocorrelation of a sequence.
+  """
+  def lag1_autocorr(xs) do
+    n = length(xs)
+    m = Enum.sum(xs) / n
+
+    {num, denom} =
+      Enum.zip(xs, tl(xs))
+      |> Enum.reduce({0.0, 0.0}, fn {a, b}, {num, _} ->
+        {num + (a - m) * (b - m), 0.0}
+      end)
+
+    denom = Enum.reduce(xs, 0.0, fn v, acc -> acc + (v - m) ** 2 end)
+
+    if denom == 0.0, do: 0.0, else: num / denom
+  end
+end
+
+real_lag1 = TestStat.lag1_autocorr(y)
+
+lag1_data =
+  Enum.map(replications, fn rep -> %{T: TestStat.lag1_autocorr(rep.yrep)} end)
+
+p_value_lag1 =
+  Enum.count(lag1_data, &(&1.T <= real_lag1)) / nrep
+
+%{
+  observed_T: Float.round(real_lag1, 4),
+  rep_T_mean: lag1_data |> Enum.map(& &1.T) |> Enum.sum() |> Kernel./(nrep) |> Float.round(4),
+  posterior_predictive_p_value: Float.round(p_value_lag1, 3)
+}
+```
+
+Newcomb's measurements were taken in time order, but his apparatus was
+mostly stationary — and the lag-1 autocorrelation should be near zero
+under the iid model. If your real data exhibit a non-trivial lag-1, this
+test rejects the iid assumption. (For Newcomb's data the p-value should
+not be extreme; the iid assumption is roughly fine even though the
+Gaussian assumption is not.)
+
+This is the PPC discipline: **pick test statistics that probe specific
+assumptions you want to validate**.
+
+| Assumption | Useful test statistic |
+|---|---|
+| Variance is correctly captured | tail probabilities, range, kurtosis (NOT variance itself) |
+| Tails are correctly captured | min, max, extreme quantiles |
+| Independence holds | lag-1 autocorrelation, runs test |
+| Distributional shape is right | quantile-quantile residuals |
+| No model component is missing | residuals stratified by predictor |
+
+## What This Tells You
+
+- **Posterior predictive checks are a discipline, not a number.** The
+  p-value is one summary; the diagnostic value is in the comparison
+  itself.
+- **A test statistic that the model fits to is a tautology.** Variance
+  for a normal model, mean for any model with a free location
+  parameter — these always pass.
+- **Tail statistics are the most useful default.** Min, max, extreme
+  quantiles. These probe the assumptions the model is most likely to
+  break.
+- **A failing PPC is a feature.** It tells you what to fix. A passing
+  PPC under a meaningful test statistic is the strongest validation a
+  Bayesian model gets.
+
+## Study Guide
+
+1. **Run the min PPC on the cleaned Newcomb data** (drop the two
+   negative values). Does the model fit now? What does the histogram
+   look like?
+
+2. **Replace the normal model with Student-t.** Use `Exmc.Dist.StudentT`
+   with `ν = 5`. Sample with `Sampler.sample/3`. Re-run all three
+   PPCs. Does the min check pass now?
+
+3. **Use the *range* `(max - min)` as a test statistic.** Is it
+   informative? Why or why not?
+
+4. **Use the *number of values below 0* as a test statistic.** This
+   directly counts the outliers. What p-value does the normal model get?
+   What does the Student-t model get?
+
+5. **(Hard.)** For the windshieldy data from Ch 3, design a test
+   statistic that would detect a missing covariate (e.g., batch effect).
+   How would you compute it from a single dataset?
+
+6. **(Hard.)** Implement the [PSIS-LOO check](https://avehtari.github.io/modelselection/CV-FAQ.html)
+   for the bioassay model from Ch 3. Hint: eXMC has `Exmc.Comparison.loo`.
+
+## Literature
+
+- **Gelman et al.** *Bayesian Data Analysis*, 3rd ed., Chapter 6
+  (model checking). The single most important chapter for becoming a
+  responsible Bayesian.
+- **Gelman, A. (2003).** "A Bayesian formulation of exploratory data
+  analysis and goodness-of-fit testing." *Int. Stat. Rev.* 71. The
+  formal argument for PPCs as exploratory analysis.
+- **Vehtari, A., Gelman, A., Gabry, J. (2017).** "Practical Bayesian
+  model evaluation using leave-one-out cross-validation and WAIC."
+  *Statistics and Computing* 27. The modern approach to model
+  comparison built on top of PPCs.
+- **Original Python demos:** `bda-ex-demos/demos_ch6/demo6_{1..4}.ipynb`.
+
+### Where to Go Next
+
+- `notebooks/bda/ch03_normal_and_bioassay.livemd` — the model whose
+  failure motivated this chapter.
+- `notebooks/03_model_comparison.livemd` — eXMC's WAIC/LOO model
+  comparison, the quantitative cousin of PPCs.
+- `notebooks/13_bayesian_spc.livemd` — PPCs in production: Bayesian
+  statistical process control with continuous predictive checks.

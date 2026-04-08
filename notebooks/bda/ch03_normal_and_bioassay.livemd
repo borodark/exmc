@@ -1,0 +1,536 @@
+# BDA Chapter 3 — Normal Models and Bioassay
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Chapter 2 gave you the easiest possible posterior — one parameter, conjugate
+update, closed form. Real data has at least two unknowns: a center and a
+spread. The instant you stop assuming you know the variance, the conjugate
+algebra gets less convenient and the geometry gets less symmetric. This
+chapter walks the canonical path: analytical posterior for the normal
+model with unknown mean **and** unknown variance, then a 2D non-conjugate
+posterior (bioassay) where you compute the answer on a grid because no clean
+formula exists. These are the two basic moves before MCMC takes over the
+work in Chapter 5.
+
+Three classic datasets, three lessons:
+
+1. **Windshieldy hardness** — normal model with unknown μ, σ². Sample
+   exactly from the joint posterior using the factorization trick.
+2. **Newcomb's speed of light** — what happens when the data have outliers
+   and your normal model insists on Gaussian tails. The motivation for
+   robust regression in later chapters.
+3. **Bioassay** — 4 dose levels, 5 animals each. Logistic dose-response.
+   No conjugacy, no closed form. Compute the joint posterior of `(α, β)`
+   on a grid, sample by inverse-CDF, derive the LD50 (the dose that kills
+   half the animals).
+
+## Part 1 — Normal Model with Unknown μ and σ²
+
+**Data:** ten hardness measurements of windshield glass (BDA3 §3.2).
+
+```elixir
+y = [93, 112, 122, 135, 122, 150, 118, 90, 124, 114]
+n = length(y)
+y_mean = Enum.sum(y) / n
+sum_sq_dev = Enum.reduce(y, 0, fn yi, acc -> acc + (yi - y_mean) ** 2 end)
+s2 = sum_sq_dev / (n - 1)
+
+%{n: n, sample_mean: y_mean, sample_variance: Float.round(s2, 2), sample_sd: Float.round(:math.sqrt(s2), 2)}
+```
+
+### The Posterior
+
+Under a non-informative prior `p(μ, σ²) ∝ 1/σ²`, the joint posterior
+factors:
+
+$$
+p(\mu, \sigma^2 \mid y) \;=\; p(\sigma^2 \mid y)\, p(\mu \mid \sigma^2, y)
+$$
+
+where
+
+$$
+\begin{aligned}
+\sigma^2 \mid y          & \sim \text{Inv-}\chi^2(n-1,\, s^2) \\
+\mu \mid \sigma^2, y     & \sim \text{Normal}\!\left(\bar y,\, \tfrac{\sigma}{\sqrt n}\right).
+\end{aligned}
+$$
+
+To sample exactly from the joint posterior, draw `σ²` from the scaled
+inverse chi-squared marginal, then draw `μ` from a normal conditional on
+that `σ²`. Both samplers exist in `:rand` and `Exmc.Math` primitives — no
+MCMC needed.
+
+```elixir
+# scaled inverse-chi-squared(ν, s²) sampling via χ²
+# σ² = ν * s² / X  where  X ~ χ²(ν) = sum of ν squared standard normals
+defmodule SampleInvChi2 do
+  def sample(nu, s2, rng) do
+    {chi2, rng} =
+      Enum.reduce(1..nu, {0.0, rng}, fn _, {acc, rng} ->
+        {z, rng} = :rand.normal_s(rng)
+        {acc + z * z, rng}
+      end)
+
+    {nu * s2 / chi2, rng}
+  end
+end
+```
+
+```elixir
+nsamp = 2_000
+seed_state = :rand.seed_s(:exsss, 0)
+
+{joint_samples, _} =
+  Enum.reduce(1..nsamp, {[], seed_state}, fn _, {acc, rng} ->
+    {sigma2, rng} = SampleInvChi2.sample(n - 1, s2, rng)
+    sigma = :math.sqrt(sigma2)
+    {z, rng} = :rand.normal_s(rng)
+    mu = y_mean + sigma / :math.sqrt(n) * z
+    {[%{mu: mu, sigma: sigma, sigma2: sigma2} | acc], rng}
+  end)
+
+joint_samples = Enum.reverse(joint_samples)
+
+mu_mean = Enum.reduce(joint_samples, 0.0, &(&1.mu + &2)) / nsamp
+sigma_mean = Enum.reduce(joint_samples, 0.0, &(&1.sigma + &2)) / nsamp
+
+%{
+  posterior_mu_mean: Float.round(mu_mean, 2),
+  posterior_sigma_mean: Float.round(sigma_mean, 2),
+  sample_mean: y_mean,
+  sample_sd: Float.round(:math.sqrt(s2), 2)
+}
+```
+
+Compare the posterior mean of `μ` to the sample mean — they should agree to
+two decimals. The posterior mean of `σ` will be slightly larger than the
+sample standard deviation because the inverse chi-squared has a heavy
+right tail (the data leave room for `σ` to be larger than the point
+estimate, but not much room for it to be smaller).
+
+```elixir
+joint_data =
+  Enum.map(joint_samples, fn s -> %{mu: s.mu, sigma: s.sigma} end)
+
+Vl.new(width: 500, height: 400, title: "Joint posterior p(μ, σ | y)")
+|> Vl.data_from_values(joint_data)
+|> Vl.mark(:circle, size: 14, opacity: 0.5, color: "#54a24b")
+|> Vl.encode_field(:x, "mu", type: :quantitative, title: "μ")
+|> Vl.encode_field(:y, "sigma", type: :quantitative, title: "σ")
+```
+
+The cloud of points *is* the joint posterior. If you wanted the marginal
+posterior of `μ`, you'd compute the empirical histogram of the `mu` column.
+If you wanted `P(σ < 15 | y)`, you'd count how many sample sigmas fall below
+
+1. Once you have samples, every question reduces to counting.
+
+### Posterior Predictive
+
+The next data point has the predictive distribution
+
+$$
+p(\tilde y \mid y) \;=\; \int p(\tilde y \mid \mu, \sigma^2)\, p(\mu, \sigma^2 \mid y)\, d\mu\, d\sigma^2.
+$$
+
+You compute it by drawing one `(μ, σ²)` from the posterior, then drawing
+one `ỹ` from `Normal(μ, σ)`. Iterate `nsamp` times. The empirical
+distribution of the resulting `ỹ` *is* the predictive distribution.
+This is the Monte Carlo trick that powers every "what should I expect from
+the next observation?" question in the rest of the book.
+
+```elixir
+seed_state = :rand.seed_s(:exsss, 1)
+
+{ynew_samples, _} =
+  Enum.reduce(joint_samples, {[], seed_state}, fn s, {acc, rng} ->
+    {z, rng} = :rand.normal_s(rng)
+    ynew = s.mu + s.sigma * z
+    {[ynew | acc], rng}
+  end)
+
+predictive_data = Enum.map(ynew_samples, fn v -> %{ynew: v} end)
+
+Vl.new(width: 600, height: 240, title: "Posterior predictive p(ỹ | y)")
+|> Vl.data_from_values(predictive_data)
+|> Vl.mark(:bar, color: "#4c78a8", opacity: 0.7)
+|> Vl.encode_field(:x, "ynew",
+  type: :quantitative,
+  bin: %{maxbins: 40},
+  title: "ỹ"
+)
+|> Vl.encode_field(:y, "ynew", type: :quantitative, aggregate: :count)
+```
+
+The predictive distribution is **wider than the posterior of μ**. It has to
+be: it includes both the uncertainty about the mean *and* the residual
+spread of any new observation around that mean. People who plot
+the posterior of `μ` and call it the "prediction interval" make this
+mistake constantly. They are off by a factor of `√(1 + 1/n)`.
+
+## Part 2 — Newcomb's Light Speed Data
+
+Newcomb measured the speed of light in 1882 by timing how long signals
+took to bounce between two locations. Some of his measurements were
+clearly bad — including two negative durations.
+
+```elixir
+# Light speed measurements (microseconds, with constants subtracted)
+light = [
+  28, 26, 33, 24, 34, -44, 27, 16, 40, -2,
+  29, 22, 24, 21, 25, 30, 23, 29, 31, 19,
+  24, 20, 36, 32, 36, 28, 25, 21, 28, 29,
+  37, 25, 28, 26, 30, 32, 36, 26, 30, 22,
+  36, 23, 27, 27, 28, 27, 31, 27, 26, 33,
+  26, 32, 32, 24, 39, 28, 24, 25, 32, 25,
+  29, 27, 28, 29, 16, 23
+]
+
+light_n = length(light)
+light_mean = Enum.sum(light) / light_n
+light_s2 =
+  Enum.reduce(light, 0, fn v, acc -> acc + (v - light_mean) ** 2 end) /
+    (light_n - 1)
+
+%{
+  n: light_n,
+  sample_mean: Float.round(light_mean, 2),
+  sample_sd: Float.round(:math.sqrt(light_s2), 2),
+  modern_value: 33.02,
+  outliers: Enum.filter(light, &(&1 < 0))
+}
+```
+
+The modern accepted value (relative to Newcomb's reference) is **33.02**.
+Two of his measurements are negative — they would imply faster than light.
+The normal model treats these as legitimate observations from the same
+Gaussian and gets dragged downward.
+
+```elixir
+# Sample the joint posterior the same way as before
+seed_state = :rand.seed_s(:exsss, 2)
+
+{light_samples, _} =
+  Enum.reduce(1..nsamp, {[], seed_state}, fn _, {acc, rng} ->
+    {sigma2, rng} = SampleInvChi2.sample(light_n - 1, light_s2, rng)
+    sigma = :math.sqrt(sigma2)
+    {z, rng} = :rand.normal_s(rng)
+    mu = light_mean + sigma / :math.sqrt(light_n) * z
+    {[%{mu: mu, sigma: sigma} | acc], rng}
+  end)
+
+light_mu_mean = Enum.reduce(light_samples, 0.0, &(&1.mu + &2)) / nsamp
+
+%{
+  posterior_mu_mean: Float.round(light_mu_mean, 2),
+  modern_value: 33.02,
+  bias: Float.round(33.02 - light_mu_mean, 2)
+}
+```
+
+The posterior mean is biased downward by the two outliers. A robust model
+would replace `Normal(μ, σ)` with `StudentT(ν, μ, σ)` for some moderate `ν`
+(say `ν = 5`), which has heavier tails and assigns lower likelihood to the
+two negative measurements *without* needing to flag them as outliers
+explicitly. eXMC has `Exmc.Dist.StudentT` — see Exercise 3 in the study
+guide.
+
+This is why **Chapter 6 spends four demos on posterior predictive checks**:
+to give you tools to detect this kind of model misfit before it causes
+trouble downstream.
+
+## Part 3 — Bioassay (2D Grid Posterior)
+
+**Data** (BDA3 p. 86): four log dose levels, five animals each, count of
+deaths per dose.
+
+| log dose `x_i` | n_i | y_i (deaths) |
+| -------------- | --- | ------------ |
+| -0.86          | 5   | 0            |
+| -0.30          | 5   | 1            |
+| -0.05          | 5   | 3            |
+| 0.73           | 5   | 5            |
+
+The model is a logistic dose-response:
+
+$$
+p(\text{death} \mid x_i, \alpha, \beta) \;=\; \text{logit}^{-1}(\alpha + \beta x_i)
+$$
+
+with binomial likelihood
+
+$$
+p(y_i \mid x_i, n_i, \alpha, \beta) \;=\; \binom{n_i}{y_i}\, p_i^{y_i}\, (1-p_i)^{n_i - y_i}
+$$
+
+and uniform prior on `(α, β)`. There is no closed form for the posterior.
+Two parameters, so the grid trick still scales: discretize on a 100×100
+grid, evaluate `log p(α, β | y)` everywhere, exponentiate, normalize.
+
+```elixir
+bx = [-0.86, -0.30, -0.05, 0.73]
+bn = [5, 5, 5, 5]
+by = [0, 1, 3, 5]
+
+defmodule Bioassay do
+  @moduledoc """
+  Log-posterior of (α, β) under uniform prior. Sums binomial log-likelihood
+  across the 4 dose groups.
+  """
+
+  def log_posterior(alpha, beta, xs, ns, ys) do
+    Enum.zip([xs, ns, ys])
+    |> Enum.reduce(0.0, fn {x, n, y}, acc ->
+      logit = alpha + beta * x
+      log_p = -log1pexp(-logit)
+      log_1mp = -log1pexp(logit)
+      acc + y * log_p + (n - y) * log_1mp
+    end)
+  end
+
+  # log(1 + exp(x)) computed stably
+  defp log1pexp(x) when x > 0, do: x + :math.log(1.0 + :math.exp(-x))
+  defp log1pexp(x), do: :math.log(1.0 + :math.exp(x))
+end
+```
+
+```elixir
+# Evaluate log-posterior on a grid
+ngrid = 100
+a_vals = Nx.linspace(-4.0, 8.0, n: ngrid) |> Nx.to_list()
+b_vals = Nx.linspace(-10.0, 40.0, n: ngrid) |> Nx.to_list()
+
+log_post_grid =
+  for a <- a_vals do
+    for b <- b_vals do
+      Bioassay.log_posterior(a, b, bx, bn, by)
+    end
+  end
+
+# Stabilize and normalize
+flat_log = log_post_grid |> List.flatten()
+max_log = Enum.max(flat_log)
+
+unnorm =
+  for row <- log_post_grid do
+    for v <- row, do: :math.exp(v - max_log)
+  end
+
+total = unnorm |> List.flatten() |> Enum.sum()
+posterior_grid = for row <- unnorm, do: for(v <- row, do: v / total)
+
+# Sanity: marginal mode
+{_max_val, best_idx} =
+  flat_log
+  |> Enum.with_index()
+  |> Enum.max_by(fn {v, _} -> v end)
+
+best_a_idx = div(best_idx, ngrid)
+best_b_idx = rem(best_idx, ngrid)
+
+%{
+  grid_size: "#{ngrid}x#{ngrid}",
+  mode_alpha: Enum.at(a_vals, best_a_idx),
+  mode_beta: Enum.at(b_vals, best_b_idx)
+}
+```
+
+```elixir
+# Visualize the grid posterior as a heatmap
+heatmap_data =
+  for {a, i} <- Enum.with_index(a_vals),
+      {b, j} <- Enum.with_index(b_vals) do
+    %{alpha: a, beta: b, density: posterior_grid |> Enum.at(i) |> Enum.at(j)}
+  end
+
+Vl.new(width: 500, height: 400, title: "Posterior p(α, β | y) on grid")
+|> Vl.data_from_values(heatmap_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "alpha", type: :quantitative, bin: %{maxbins: ngrid}, title: "α")
+|> Vl.encode_field(:y, "beta", type: :quantitative, bin: %{maxbins: ngrid}, title: "β")
+|> Vl.encode_field(:color, "density", type: :quantitative, scale: %{scheme: "viridis"})
+```
+
+The posterior tilts diagonally. `α` and `β` are **strongly correlated** —
+because changing `α` shifts the curve left/right and changing `β` rotates
+it, the data constrain a *combination* of the two more tightly than
+either alone. This is exactly the kind of geometry that makes naive
+samplers struggle and that motivates dense mass matrices in NUTS.
+
+### Sampling from the Grid
+
+To compute the LD50 (the dose at which `P(death) = 0.5`, i.e. `α + β·x = 0`,
+i.e. `x = -α/β`), we need joint samples from the grid posterior. Same trick
+as Ch 2, demo 4: flatten the grid, build a CDF, draw `u ~ Uniform(0,1)`,
+look up the cell. Then add small jitter (BDA3 p. 76) to spread samples
+within each grid cell.
+
+```elixir
+flat_p = posterior_grid |> List.flatten()
+
+{cdf, _} =
+  Enum.map_reduce(flat_p, 0.0, fn p, acc ->
+    new = acc + p
+    {new, new}
+  end)
+
+dx_a = Enum.at(a_vals, 1) - Enum.at(a_vals, 0)
+dx_b = Enum.at(b_vals, 1) - Enum.at(b_vals, 0)
+
+seed_state = :rand.seed_s(:exsss, 3)
+n_grid_samples = 1_500
+
+{ab_samples, _} =
+  Enum.reduce(1..n_grid_samples, {[], seed_state}, fn _, {acc, rng} ->
+    {u, rng} = :rand.uniform_s(rng)
+    idx = Enum.find_index(cdf, &(&1 >= u)) || ngrid * ngrid - 1
+    i = div(idx, ngrid)
+    j = rem(idx, ngrid)
+    a = Enum.at(a_vals, i)
+    b = Enum.at(b_vals, j)
+    # jitter within the cell
+    {ja, rng} = :rand.uniform_s(rng)
+    {jb, rng} = :rand.uniform_s(rng)
+    a_jit = a + (ja - 0.5) * dx_a
+    b_jit = b + (jb - 0.5) * dx_b
+    {[%{alpha: a_jit, beta: b_jit} | acc], rng}
+  end)
+
+ab_samples = Enum.reverse(ab_samples)
+
+# LD50 = -alpha / beta, only meaningful when beta > 0
+ld50_samples =
+  ab_samples
+  |> Enum.filter(&(&1.beta > 0))
+  |> Enum.map(&(-&1.alpha / &1.beta))
+
+p_beta_positive = length(ld50_samples) / length(ab_samples)
+ld50_mean =
+  if ld50_samples == [], do: 0.0, else: Enum.sum(ld50_samples) / length(ld50_samples)
+
+%{
+  total_samples: length(ab_samples),
+  beta_positive_count: length(ld50_samples),
+  p_beta_positive: Float.round(p_beta_positive, 3),
+  ld50_mean: Float.round(ld50_mean, 3)
+}
+```
+
+`P(β > 0 | y)` is the posterior probability that the drug is a stimulant
+of death (positive dose-response). With this small dataset, it should be
+very high but not exactly 1. The conditional LD50 mean lives somewhere
+near `-0.1` log dose units — between the second and third dose levels, where
+roughly half the animals died.
+
+```elixir
+ab_data = Enum.map(ab_samples, fn s -> %{alpha: s.alpha, beta: s.beta} end)
+
+scatter =
+  Vl.new(width: 400, height: 320, title: "Posterior samples (α, β)")
+  |> Vl.data_from_values(ab_data)
+  |> Vl.mark(:circle, size: 14, opacity: 0.5, color: "#4c78a8")
+  |> Vl.encode_field(:x, "alpha", type: :quantitative, title: "α")
+  |> Vl.encode_field(:y, "beta", type: :quantitative, title: "β")
+
+ld50_data = Enum.map(ld50_samples, fn v -> %{ld50: v} end)
+
+ld50_hist =
+  Vl.new(width: 400, height: 320, title: "LD50 = -α/β (β > 0)")
+  |> Vl.data_from_values(ld50_data)
+  |> Vl.mark(:bar, color: "#54a24b", opacity: 0.7)
+  |> Vl.encode_field(:x, "ld50",
+    type: :quantitative,
+    bin: %{maxbins: 30},
+    title: "LD50 (log dose units)"
+  )
+  |> Vl.encode_field(:y, "ld50", type: :quantitative, aggregate: :count)
+
+Vl.new() |> Vl.concat([scatter, ld50_hist], :horizontal)
+```
+
+## What This Tells You
+
+* **Conjugate factorization is exact and free.** When the math works
+  (normal model, normal-inverse-χ²), use it. You don't need MCMC for two
+  parameters of a normal model.
+* **Outliers break the normal model.** Newcomb's two negative
+  measurements drag the posterior down. The fix is to switch to
+  Student-t — a one-line model change.
+* **Grid posteriors scale to ~2 dimensions.** Bioassay's `(α, β)` fit on
+  a 100×100 grid in milliseconds. At 5+ dimensions the grid explodes, and
+  you must move to MCMC. **This is the boundary where Chapter 5 begins.**
+* **Posterior predictive ≠ posterior of μ.** The predictive distribution
+  is wider because it includes residual variability. Don't conflate them.
+
+## Study Guide
+
+1. **Repeat Part 1** with `windshieldy2` data (also in `data/`). Are the
+   posteriors of `μ` significantly different between the two batches?
+   What's `P(μ_2 > μ_1 | data)`?
+
+2. **Robust regression for Newcomb.** Replace the normal model with
+   `Exmc.Dist.StudentT` (`ν = 5`, fixed). Use eXMC's `Sampler.sample/3`
+   instead of analytical sampling — there is no clean closed form for
+   Student-t with unknown μ, σ. Compare the posterior mean of `μ` to
+   Part 2. How much closer to 33.02 do you get?
+
+3. **Cut the negative outliers** from Newcomb's data and refit the normal
+   model. Compare to the robust answer from Exercise 2. Which approach
+   would you trust more? Why?
+
+4. **LD50 as a posterior probability statement.** From the bioassay
+   samples, compute `P(LD50 < 0 | y)` — the probability that the
+   half-lethal dose is below `log(1) = 0`. This is a substantively
+   meaningful safety question.
+
+5. **Grid resolution.** Halve `ngrid` to 50 and double it to 200. Does
+   the posterior heatmap change? Does the LD50 estimate change? How does
+   computation time scale?
+
+6. **(Hard.)** Re-derive the normal posterior using `Exmc.Sampler.sample`
+   with `μ ~ Normal(120, 50)` and `σ ~ HalfNormal(50)` priors instead of
+   the non-informative prior. Compare to the analytical sampler in
+   Part 1. With weak priors, the answers should agree to two decimal
+   places.
+
+## Literature
+
+* **Gelman et al.** *Bayesian Data Analysis*, 3rd ed., §3.2 (normal
+  model with unknown mean and variance) and §3.7 (bioassay).
+* **Stigler, S.** *The History of Statistics*, ch. 2 — Newcomb and the
+  history of measurement uncertainty.
+* **Original Python demos:** `bda-ex-demos/demos_ch3/demo3_{1-4,5,6}.ipynb`.
+
+### Where to Go Next
+
+* `notebooks/bda/ch04_normal_approximation.livemd` — the same bioassay
+  posterior, approximated by a normal centered at the mode. The fastest
+  approximation that still gets the right uncertainty.
+* `notebooks/bda/ch06_posterior_predictive.livemd` — the systematic way
+  to detect the kind of model misfit you saw in Newcomb.
+* `notebooks/bda/ch11_gibbs_metropolis.livemd` — what to do when the grid
+  doesn't fit anymore (and Gibbs and Metropolis still aren't enough,
+  because that's what NUTS solves).

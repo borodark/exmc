@@ -1,0 +1,348 @@
+# BDA Chapter 9 — Decision Analysis (Jar of Coins)
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Posteriors are not decisions. A posterior says "the parameter is most
+likely 0.45 with a 95% interval of (0.40, 0.50)." A decision is an
+**action you take** that has consequences depending on the unknown truth.
+The bridge between the two is **decision theory**: maximize the expected
+utility of your action under the posterior.
+
+The classic example, due to Andrew Gelman: **Prof Gelman holds up a jar of
+coins.** He tells the students that whoever guesses the right number of
+coins gets to keep all of them. The students discuss and present their
+collective uncertainty as `N(160, 40)` — a normal distribution centered
+at 160 coins with a standard deviation of 40.
+
+**What number should they guess?**
+
+Three plausible answers, each *correct* under a different objective:
+
+1. **The most probable value.** If you only care about being exactly right,
+   you should guess the mode of the posterior. For a normal distribution,
+   the mode is the mean: **160**.
+2. **The expected value.** If you care about how many coins you take home
+   on average, you maximize the expected number — but the *expected
+   number* depends on your guess and the rules of the game. With "you
+   only get the coins if your guess is correct," the answer is *not* 160.
+3. **The number that maximizes expected utility.** When utility is linear
+   in money, this becomes "maximize the product `guess × P(guess is
+   correct)`." That product is maximized somewhere **above** 160, because
+   guessing higher trades a small drop in probability for a larger payoff.
+
+The whole chapter is the simplest possible case where the answers
+disagree. It is small, and it is the seed of every more complex Bayesian
+decision problem: A/B testing under business cost asymmetry, treatment
+allocation under unknown effect size, inventory ordering under uncertain
+demand. In every one of those, the "right answer" depends on the
+**utility function** you actually care about, not the posterior alone.
+
+## The Belief State
+
+The students' uncertainty is `N(160, 40)`. That's the prior over the true
+number of coins. Visualize it.
+
+```elixir
+m = 160
+s = 40
+
+# Grid in coin counts
+xs = Enum.to_list((m - 3 * s)..(m + 3 * s))
+n_xs = length(xs)
+
+defmodule NormalPdf do
+  def pdf(x, mu, sigma) do
+    z = (x - mu) / sigma
+    1.0 / (sigma * :math.sqrt(2 * :math.pi())) * :math.exp(-0.5 * z * z)
+  end
+end
+
+belief_data =
+  Enum.map(xs, fn x -> %{coins: x, density: NormalPdf.pdf(x * 1.0, m * 1.0, s * 1.0)} end)
+
+Vl.new(width: 600, height: 240, title: "Posterior belief: N(160, 40)")
+|> Vl.data_from_values(belief_data)
+|> Vl.mark(:area, color: "#4c78a8", opacity: 0.6)
+|> Vl.encode_field(:x, "coins", type: :quantitative, title: "number of coins")
+|> Vl.encode_field(:y, "density", type: :quantitative, title: "p(N)")
+```
+
+## Strategy 1 — Guess the Mode
+
+If you guess the most probable value, you guess **160**. For a Normal,
+mode = mean. Done.
+
+The probability you get exactly 160 is small in absolute terms (it's a
+discrete win condition over a continuous-ish belief), but among all
+possible single-integer guesses, 160 has the highest single probability.
+
+```elixir
+mode_guess = m
+mode_prob = NormalPdf.pdf(mode_guess * 1.0, m * 1.0, s * 1.0)
+
+%{
+  guess: mode_guess,
+  prob_density_at_guess: Float.round(mode_prob, 5),
+  expected_payout_naive: Float.round(mode_guess * mode_prob, 3)
+}
+```
+
+The "expected payout" under the mode strategy is `160 × p(160) ≈ 1.6`
+coins on average. That feels low because it is — you almost never win,
+and when you do, you win 160. Most of the time you win nothing.
+
+## Strategy 2 — Maximize Expected Utility (Linear in Money)
+
+Now ask the question that maximizes the *expected number of coins
+you take home*, not the probability of being right. If your utility is
+linear in coins, the expected utility of guessing `a` is
+
+$$
+\mathrm{EU}(a) = a \cdot p(a)
+$$
+
+— you get `a` coins if you guess right, with probability `p(a)`. You
+maximize this product by **picking a guess where the marginal increase
+in `a` exceeds the marginal drop in `p(a)`**. For a Normal posterior,
+that's *not* the mean; it's somewhere to the right of the mean, because
+high guesses have low probability but high payoff.
+
+```elixir
+expected_utility =
+  Enum.map(xs, fn x ->
+    p = NormalPdf.pdf(x * 1.0, m * 1.0, s * 1.0)
+    %{guess: x, eu: x * p}
+  end)
+
+best = Enum.max_by(expected_utility, & &1.eu)
+%{
+  best_guess: best.guess,
+  expected_utility_at_best: Float.round(best.eu, 3),
+  expected_utility_at_mode: Float.round(NormalPdf.pdf(160 * 1.0, 160 * 1.0, 40 * 1.0) * 160, 3)
+}
+```
+
+The **expected-utility-maximizing guess** is somewhere around 173–176.
+Guessing 175 instead of 160 raises the expected payout from ~1.6 coins to
+~1.8 coins — a 12% improvement just from picking the right number.
+
+```elixir
+expected_utility
+|> then(fn data ->
+  Vl.new(width: 600, height: 280, title: "Expected utility EU(a) = a · p(a)")
+  |> Vl.data_from_values(data)
+  |> Vl.layers([
+    Vl.new()
+    |> Vl.mark(:line, color: "#54a24b", stroke_width: 2)
+    |> Vl.encode_field(:x, "guess", type: :quantitative, title: "guess (a)")
+    |> Vl.encode_field(:y, "eu", type: :quantitative, title: "EU(a)"),
+    Vl.new()
+    |> Vl.data_from_values([%{guess: best.guess, eu: best.eu}])
+    |> Vl.mark(:point, color: "#e45756", size: 200, filled: true)
+    |> Vl.encode_field(:x, "guess", type: :quantitative)
+    |> Vl.encode_field(:y, "eu", type: :quantitative)
+  ])
+end)
+```
+
+The peak of the green curve is the optimal guess for a linear-utility
+maximizer. It is to the right of the posterior mean.
+
+## Why the Two Answers Disagree
+
+Plot both strategies on the same axis:
+
+```elixir
+overlay =
+  for %{coins: c, density: d} <- belief_data do
+    [
+      %{coins: c, value: d * 4_000, kind: "p(N) (rescaled)"},
+      %{coins: c, value: c * d, kind: "EU(a) = a · p(a)"}
+    ]
+  end
+  |> List.flatten()
+
+mode_marker = [%{coins: 160, value: 0, kind: "Mode (160)"}]
+eu_marker = [%{coins: best.guess, value: 0, kind: "EU max (#{best.guess})"}]
+
+Vl.new(width: 600, height: 320, title: "Mode of belief vs expected-utility maximum")
+|> Vl.data_from_values(overlay)
+|> Vl.mark(:line, stroke_width: 2)
+|> Vl.encode_field(:x, "coins", type: :quantitative)
+|> Vl.encode_field(:y, "value", type: :quantitative)
+|> Vl.encode_field(:color, "kind", type: :nominal)
+```
+
+The blue curve is the rescaled posterior. The green curve is the expected
+utility. The peaks are in different places. **The answer to "what should
+I do?" depends on the utility function, not just on the belief state.**
+This is the core insight of decision theory.
+
+## Generalization to Asymmetric Utility
+
+What if guessing *too high* costs you something — say, the professor
+penalizes overconfident guesses by deducting twice the difference if you
+overshoot? Then your utility function isn't `a · 1[a = N]`; it's
+something like
+
+$$
+U(a, N) =
+\begin{cases}
+a       & \text{if } a = N \\
+-2(a - N) & \text{if } a > N \\
+0       & \text{if } a < N
+\end{cases}
+$$
+
+The optimal guess shifts back **left** of the mode. The exact amount
+depends on the penalty schedule. This is exactly the structure of
+inventory problems (overstock cost vs stockout cost), medical dosing
+(under-dose ineffective vs over-dose toxic), and investment allocation
+(left tail risk).
+
+```elixir
+defmodule Utility do
+  @doc """
+  Asymmetric utility: you get `a` coins if exactly right, `-penalty * (a - N)`
+  if you overshoot by N, 0 otherwise. Compute expected utility under
+  Normal(mu, sigma) belief by integrating over a coarse grid.
+  """
+  def expected(a, mu, sigma, xs, penalty) do
+    Enum.reduce(xs, 0.0, fn n, acc ->
+      p = NormalPdf.pdf(n * 1.0, mu * 1.0, sigma * 1.0)
+
+      u =
+        cond do
+          a == n -> a
+          a > n -> -penalty * (a - n)
+          a < n -> 0
+        end
+
+      acc + u * p
+    end)
+  end
+end
+
+asymmetric =
+  for a <- xs do
+    eu = Utility.expected(a, m, s, xs, 2.0)
+    %{guess: a, eu: eu}
+  end
+
+best_asym = Enum.max_by(asymmetric, & &1.eu)
+
+%{
+  best_guess_asymmetric: best_asym.guess,
+  best_eu_asymmetric: Float.round(best_asym.eu, 2),
+  comparison: "linear utility max was #{best.guess}, asymmetric (penalty=2) is #{best_asym.guess}"
+}
+```
+
+```elixir
+combined =
+  Enum.map(expected_utility, fn %{guess: g, eu: e} ->
+    %{guess: g, eu: e, kind: "Linear: U = a · 1[a=N]"}
+  end) ++
+    Enum.map(asymmetric, fn %{guess: g, eu: e} ->
+      %{guess: g, eu: e, kind: "Asymmetric: −2 if overshoot"}
+    end)
+
+Vl.new(width: 600, height: 320, title: "Expected utility under different utility functions")
+|> Vl.data_from_values(combined)
+|> Vl.mark(:line, stroke_width: 2)
+|> Vl.encode_field(:x, "guess", type: :quantitative, title: "guess")
+|> Vl.encode_field(:y, "eu", type: :quantitative, title: "EU")
+|> Vl.encode_field(:color, "kind", type: :nominal)
+```
+
+The two utility curves peak in *different places*. The asymmetric one
+(penalize overshoot) peaks **lower** than the symmetric one. Same
+posterior, same belief state, different optimal action — because the
+consequences of being wrong are different in different directions.
+
+## What This Tells You
+
+- **A posterior is a *belief*. A decision is an *action*.** They are not
+  the same object. The decision is what you take to your boss.
+- **The optimal action depends on the utility function** as much as on
+  the posterior. Two analysts with the same data can defensibly
+  recommend different actions if they disagree about the utility.
+- **Symmetric utility ⟹ guess near the mode.** Asymmetric utility ⟹
+  shift toward the cheaper side of being wrong. Always.
+- **The expected utility is computable from samples.** If you have
+  posterior samples `θ_1, …, θ_S` and a utility function `U(a, θ)`, then
+  `EU(a) ≈ (1/S) ∑ U(a, θ_s)`. Optimize over `a` numerically. This is
+  how every Bayesian decision problem actually gets solved in practice.
+- **Most "optimization under uncertainty" problems are this.** The
+  framework scales from one parameter to thousands.
+
+## Study Guide
+
+1. **What if the belief is `N(160, 10)` instead of `N(160, 40)`?** With
+   the data ten times sharper, where does the linear-utility optimum
+   move? Why does it move *less* than you'd expect?
+
+2. **What if the belief is a *skewed* distribution** — e.g.,
+   `LogNormal(log(160), 0.25)`? Re-derive the linear-utility optimum.
+   Is it above or below the mean now? Above or below the mode?
+
+3. **Reframe the problem in money.** Suppose each coin is worth $0.25,
+   and a wrong guess costs you nothing. What does the optimal guess
+   become? Why is it the same as the linear-utility answer?
+
+4. **Reframe with risk aversion.** Replace linear utility `U(a) = a`
+   with concave `U(a) = √a`. Re-run the Strategy 2 calculation. Does
+   the optimal guess move higher or lower?
+
+5. **Hospital allocation.** A hospital has uncertain demand for ICU
+   beds, modeled as `N(80, 15)`. They can stock 0–150 beds. Each bed
+   costs $200/day; a stockout costs $5000 per under-bed. Find the
+   expected-cost-minimizing inventory level.
+
+6. **(Hard.)** Connect this back to `notebooks/06_dca_business.livemd`
+   (decision-curve analysis). Show that DCA is exactly this calculation
+   averaged over a posterior of treatment effect.
+
+## Literature
+
+- **Gelman et al.** *Bayesian Data Analysis*, 3rd ed., Chapter 9
+  (decision analysis). The general framework with examples from medical
+  testing and pharmaceutical regulation.
+- **Berger, J. O. (1985).** *Statistical Decision Theory and Bayesian
+  Analysis*, 2nd ed. The classical reference for the formal apparatus.
+- **Robert, C. (2007).** *The Bayesian Choice*, 2nd ed., Chapter 2.
+  Concise modern treatment with worked examples.
+- **Original Python demo:** `bda-ex-demos/demos_ch9/demo9_1.ipynb`.
+
+### Where to Go Next
+
+- `notebooks/06_dca_business.livemd` — the same expected-utility logic
+  applied to clinical decision making (decision-curve analysis).
+- `notebooks/12_poker_bayesian.livemd` — uses the posterior over
+  opponent parameters to compute expected value of fold/call/raise
+  decisions.
+- `notebooks/bda/ch11_gibbs_metropolis.livemd` — when the posterior is
+  too complex to integrate analytically and you must compute expected
+  utility from samples.

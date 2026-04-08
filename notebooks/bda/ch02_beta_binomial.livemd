@@ -1,0 +1,489 @@
+# BDA Chapter 2 — Beta–Binomial: Placenta Previa
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Placenta previa is a pregnancy complication. In a 1980s German study,
+**980 births to women with this condition** produced **437 girls and 543 boys**.
+The proportion of girls in the general population is about **0.485**. The
+question is plain enough to ask out loud:
+
+> Does placenta previa shift the sex ratio?
+
+The sample proportion is `437 / 980 = 0.446`. That is lower than 0.485. But
+sample proportions wobble. With 980 births, how much wobble is plausible just
+from chance? Frequentists answer with a confidence interval. Bayesians answer
+with a *posterior distribution* over the unknown true proportion `θ`. That
+posterior is the entire object of inference — it tells you everything you can
+know about `θ` from the data and your prior beliefs.
+
+This is BDA3's first worked example for a reason. Every hierarchical model,
+every PPL benchmark, every Stan tutorial begins here, because the math is
+**conjugate** — you can write the posterior in closed form. No sampler
+required. We use it as a checkpoint: if you can't reproduce this answer, you
+can't trust anything more complicated.
+
+## The Problem
+
+Place a uniform prior on `θ`:
+
+$$
+p(\theta) = \mathrm{Beta}(\theta \mid 1, 1) = 1 \quad \text{for } \theta \in [0, 1].
+$$
+
+The likelihood for `y = 437` girls in `n = 980` independent births is binomial:
+
+$$
+p(y \mid \theta) = \binom{n}{y}\, \theta^{y} (1-\theta)^{n-y}.
+$$
+
+The posterior is proportional to prior × likelihood. Because the Beta family is
+conjugate to the binomial,
+
+$$
+p(\theta \mid y, n) \propto \theta^{y} (1-\theta)^{n-y} = \mathrm{Beta}(\theta \mid y+1,\; n-y+1).
+$$
+
+So with a `Beta(1,1)` prior, the posterior is **Beta(438, 544)**. No sampling.
+No optimization. Just arithmetic.
+
+```elixir
+# Data — BDA3 p. 37
+y = 437
+n = 980
+n_boys = n - y
+
+%{girls: y, boys: n_boys, total: n, sample_proportion: y / n}
+```
+
+## The Posterior — Analytical Form
+
+We compute the Beta(438, 544) density on a fine grid using `Exmc.Dist.Beta` so
+the math you read above is the math the runtime executes. There is no
+approximation here.
+
+```elixir
+alias Exmc.Dist.Beta
+alias Exmc.Math
+
+# Posterior Beta(α, β) parameters
+alpha = y + 1
+beta = n - y + 1
+
+# Evaluate density on a grid in θ-space
+grid = Nx.linspace(0.35, 0.55, n: 400) |> Nx.to_list()
+
+posterior_pdf =
+  for theta <- grid do
+    log_p =
+      Beta.logpdf(
+        Nx.tensor(theta),
+        %{alpha: Nx.tensor(alpha * 1.0), beta: Nx.tensor(beta * 1.0)}
+      )
+      |> Nx.to_number()
+
+    %{theta: theta, density: :math.exp(log_p)}
+  end
+
+%{alpha: alpha, beta: beta, mean: alpha / (alpha + beta)}
+```
+
+```elixir
+# Posterior mean, mode, and 95% central interval (analytical)
+post_mean = alpha / (alpha + beta)
+post_mode = (alpha - 1) / (alpha + beta - 2)
+post_var = alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1))
+post_sd = :math.sqrt(post_var)
+
+# 95% CI via normal approximation (BDA3 p. 38 — accurate when n is large)
+ci_lo = post_mean - 1.96 * post_sd
+ci_hi = post_mean + 1.96 * post_sd
+
+%{
+  posterior_mean: Float.round(post_mean, 4),
+  posterior_mode: Float.round(post_mode, 4),
+  posterior_sd: Float.round(post_sd, 5),
+  ci_95: {Float.round(ci_lo, 4), Float.round(ci_hi, 4)},
+  baseline: 0.485
+}
+```
+
+The posterior is centered at **0.446** with a 95% interval of roughly
+**(0.415, 0.477)**. The general-population baseline of **0.485** lies above
+this interval. The conclusion: under a uniform prior, the data are consistent
+with placenta previa shifting the sex ratio downward, not with the baseline.
+
+## Plotting the Posterior
+
+```elixir
+baseline_data = [
+  %{x: 0.485, y_top: 0, y_bot: 28, label: "general population (0.485)"}
+]
+
+Vl.new(width: 600, height: 280, title: "Posterior p(θ | y=437, n=980)")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(posterior_pdf)
+  |> Vl.mark(:area, color: "#4c78a8", opacity: 0.5)
+  |> Vl.encode_field(:x, "theta", type: :quantitative, title: "θ (proportion of girls)")
+  |> Vl.encode_field(:y, "density", type: :quantitative, title: "p(θ|y,n)"),
+  Vl.new()
+  |> Vl.data_from_values(baseline_data)
+  |> Vl.mark(:rule, color: "#e45756", stroke_width: 2, stroke_dash: [4, 4])
+  |> Vl.encode_field(:x, "x", type: :quantitative)
+])
+```
+
+The vertical dashed line is the general-population baseline. The posterior
+mass to the left of it is the answer to "how confident am I that placenta
+previa lowers the proportion of girls?" Almost all of the posterior mass is
+to the left — overwhelming evidence under this prior.
+
+## Demo 2 — Prior Sensitivity
+
+A reasonable critique: "you put a flat prior on θ, but I have other beliefs."
+With a Beta(α₀, β₀) prior, the conjugate update is
+
+$$
+p(\theta \mid y, n) = \mathrm{Beta}(\theta \mid \alpha_0 + y,\; \beta_0 + n - y).
+$$
+
+Let's compare four priors of varying strength, all centered on the
+general-population baseline of 0.485:
+
+| Prior           | α₀ | β₀ | Effective sample size α₀+β₀ | What it encodes                     |
+| --------------- | ----- | ----- | --------------------------------- | ----------------------------------- |
+| Uniform         | 1     | 1     | 2                                 | "no idea"                           |
+| Weak (~10)      | 4.85  | 5.15  | 10                                | "baseline + 10 hypothetical births" |
+| Moderate (~100) | 48.5  | 51.5  | 100                               | "baseline + 100 births"             |
+| Strong (~1000)  | 485   | 515   | 1000                              | "baseline + 1000 births"            |
+
+```elixir
+priors = [
+  %{label: "Uniform Beta(1,1)", a0: 1.0, b0: 1.0},
+  %{label: "Weak Beta(4.85, 5.15)", a0: 4.85, b0: 5.15},
+  %{label: "Moderate Beta(48.5, 51.5)", a0: 48.5, b0: 51.5},
+  %{label: "Strong Beta(485, 515)", a0: 485.0, b0: 515.0}
+]
+
+prior_sensitivity_data =
+  for %{label: label, a0: a0, b0: b0} <- priors,
+      theta <- grid do
+    a = a0 + y
+    b = b0 + n - y
+
+    log_p =
+      Beta.logpdf(Nx.tensor(theta), %{alpha: Nx.tensor(a), beta: Nx.tensor(b)})
+      |> Nx.to_number()
+
+    %{theta: theta, density: :math.exp(log_p), prior: label}
+  end
+
+Vl.new(width: 600, height: 320, title: "Posterior vs prior strength")
+|> Vl.data_from_values(prior_sensitivity_data)
+|> Vl.mark(:line, stroke_width: 2)
+|> Vl.encode_field(:x, "theta", type: :quantitative, title: "θ")
+|> Vl.encode_field(:y, "density", type: :quantitative, title: "p(θ|y,n)")
+|> Vl.encode_field(:color, "prior", type: :nominal)
+```
+
+Read the colors. Three of the four priors agree closely — the data
+overwhelm the prior. Only the **Strong** prior (1000 hypothetical births
+worth of "baseline" prior weight) pulls the posterior visibly toward 0.485.
+For 980 actual observations to be moved by a prior, that prior has to claim
+to be worth at least as much information.
+
+This is the meaningful version of "Bayesian methods are subjective." The
+prior matters in proportion to its claimed effective sample size, and at this
+data scale anything weaker than ~500 prior pseudo-observations is
+inconsequential.
+
+## Demo 3 — Sampling from the Posterior, Transforming Variables
+
+Even though the posterior is analytical, we often want to compute
+expectations of *functions* of θ — like the log-odds. Two ways:
+
+1. **Analytically** — the log-odds of a Beta variate has no clean
+   closed form, so we'd need numerical integration.
+2. **Monte Carlo** — draw `S` samples from `Beta(438, 544)`, transform each,
+   summarize empirically.
+
+This is the entry point to the Monte Carlo philosophy that powers every
+sampler in this book and library. If you can sample, you can compute any
+expectation.
+
+```elixir
+# Draw samples from Beta(438, 544) using Exmc.Dist.Beta.sample.
+# Beta.sample requires a threaded :rand state, so we accumulate via reduce.
+n_samples = 5_000
+beta_params = %{alpha: Nx.tensor(alpha * 1.0), beta: Nx.tensor(beta * 1.0)}
+seed_state = :rand.seed_s(:exsss, 42)
+
+{samples, _final_rng} =
+  Enum.reduce(1..n_samples, {[], seed_state}, fn _, {acc, rng} ->
+    {x, rng} = Beta.sample(beta_params, rng)
+    {[Nx.to_number(x) | acc], rng}
+  end)
+
+samples = Enum.reverse(samples)
+
+# Transform: log-odds = log(θ / (1 - θ))
+log_odds = Enum.map(samples, fn p -> :math.log(p / (1.0 - p)) end)
+
+%{
+  theta_mean: Enum.sum(samples) / n_samples,
+  log_odds_mean: Enum.sum(log_odds) / n_samples,
+  log_odds_baseline: :math.log(0.485 / (1 - 0.485))
+}
+```
+
+The transformed mean is the **posterior mean of the log-odds**. Compare to the
+log-odds of the population baseline. Because the log transform is monotonic,
+the same conclusion holds — the posterior mass sits below the baseline — but
+now in a parameterization where Normal approximations behave better.
+
+```elixir
+sample_data = Enum.map(samples, fn s -> %{theta: s} end)
+log_odds_data = Enum.map(log_odds, fn lo -> %{log_odds: lo} end)
+
+theta_hist =
+  Vl.new(width: 280, height: 200, title: "θ samples")
+  |> Vl.data_from_values(sample_data)
+  |> Vl.mark(:bar, color: "#4c78a8", opacity: 0.7)
+  |> Vl.encode_field(:x, "theta",
+    type: :quantitative,
+    bin: %{maxbins: 40},
+    title: "θ"
+  )
+  |> Vl.encode_field(:y, "theta", type: :quantitative, aggregate: :count)
+
+logodds_hist =
+  Vl.new(width: 280, height: 200, title: "log(θ/(1−θ)) samples")
+  |> Vl.data_from_values(log_odds_data)
+  |> Vl.mark(:bar, color: "#54a24b", opacity: 0.7)
+  |> Vl.encode_field(:x, "log_odds",
+    type: :quantitative,
+    bin: %{maxbins: 40},
+    title: "log-odds"
+  )
+  |> Vl.encode_field(:y, "log_odds", type: :quantitative, aggregate: :count)
+
+Vl.new()
+|> Vl.concat([theta_hist, logodds_hist], :horizontal)
+```
+
+## Demo 4 — Non-Conjugate Prior, Grid Posterior
+
+Conjugacy is convenient but not necessary. Suppose your prior is *not* a Beta
+— maybe a triangular density that puts most weight near 0.485 and falls off
+linearly. This kind of prior is what scientists actually elicit when forced
+to draw a curve on paper. There is no closed form. So we evaluate
+**prior × likelihood on a grid**, normalize numerically, and sample by inverse-CDF.
+
+```elixir
+defmodule Triangular do
+  @moduledoc """
+  A triangular prior on [0, 1], peak at `mode`, vanishing at 0 and 1.
+  """
+
+  def logpdf(x, mode) do
+    cond do
+      x <= 0.0 or x >= 1.0 -> :neg_infinity
+      x < mode -> :math.log(2.0 * x / mode)
+      true -> :math.log(2.0 * (1.0 - x) / (1.0 - mode))
+    end
+  end
+end
+```
+
+```elixir
+# Grid evaluation: log p(θ|y,n) ∝ log p(θ) + log p(y|θ)
+fine_grid = Nx.linspace(0.001, 0.999, n: 1_000) |> Nx.to_list()
+mode_prior = 0.485
+
+log_unnorm =
+  for theta <- fine_grid do
+    lp_prior = Triangular.logpdf(theta, mode_prior)
+    lp_lik = y * :math.log(theta) + (n - y) * :math.log(1.0 - theta)
+
+    case lp_prior do
+      :neg_infinity -> :neg_infinity
+      v when is_number(v) -> v + lp_lik
+    end
+  end
+
+# Subtract max for numerical stability before exponentiating
+max_log =
+  log_unnorm
+  |> Enum.filter(&is_number/1)
+  |> Enum.max()
+
+unnorm_p =
+  Enum.map(log_unnorm, fn
+    :neg_infinity -> 0.0
+    v -> :math.exp(v - max_log)
+  end)
+
+# Normalize (trapezoidal — adequate on a uniform grid this fine)
+dx = Enum.at(fine_grid, 1) - Enum.at(fine_grid, 0)
+norm_const = Enum.sum(unnorm_p) * dx
+posterior_p = Enum.map(unnorm_p, &(&1 / norm_const))
+
+%{normalizing_constant: norm_const, grid_size: length(fine_grid)}
+```
+
+```elixir
+non_conjugate_data =
+  Enum.zip(fine_grid, posterior_p)
+  |> Enum.map(fn {t, p} -> %{theta: t, density: p} end)
+
+triangular_prior_data =
+  Enum.map(fine_grid, fn t ->
+    case Triangular.logpdf(t, mode_prior) do
+      :neg_infinity -> %{theta: t, density: 0.0}
+      v -> %{theta: t, density: :math.exp(v)}
+    end
+  end)
+
+Vl.new(width: 600, height: 320, title: "Non-conjugate posterior (triangular prior)")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(triangular_prior_data)
+  |> Vl.mark(:line, color: "#e45756", stroke_width: 2, stroke_dash: [4, 4])
+  |> Vl.encode_field(:x, "theta", type: :quantitative, title: "θ")
+  |> Vl.encode_field(:y, "density", type: :quantitative, title: "density"),
+  Vl.new()
+  |> Vl.data_from_values(non_conjugate_data)
+  |> Vl.mark(:area, color: "#4c78a8", opacity: 0.5)
+  |> Vl.encode_field(:x, "theta", type: :quantitative)
+  |> Vl.encode_field(:y, "density", type: :quantitative)
+])
+```
+
+The triangular prior (red dashed) peaks at the population baseline. The
+posterior (blue) has been pulled toward the data: it sits between the prior's
+peak and the sample proportion. With a strong informative prior, the
+posterior is a *compromise*. With a weak prior, the data win. With moderate
+priors, you get to watch the negotiation.
+
+### Sampling from a Grid Posterior (Inverse-CDF)
+
+Now that you have a normalized discrete posterior, you sample by drawing
+`u ~ Uniform(0,1)` and looking up the smallest grid index whose cumulative
+mass exceeds `u`. This is identical in spirit to how a particle filter
+resamples, and it's a useful primitive whenever you can't sample directly
+from the prior×likelihood object.
+
+```elixir
+# Build CDF on the grid
+{cdf, _} =
+  Enum.map_reduce(posterior_p, 0.0, fn p, acc ->
+    new = acc + p * dx
+    {new, new}
+  end)
+
+:rand.seed(:exsss, 42)
+
+inverse_cdf_sample = fn ->
+  u = :rand.uniform()
+
+  Enum.find_index(cdf, &(&1 >= u))
+  |> case do
+    nil -> List.last(fine_grid)
+    i -> Enum.at(fine_grid, i)
+  end
+end
+
+grid_samples = for _ <- 1..2_000, do: inverse_cdf_sample.()
+
+%{
+  grid_sample_mean: Enum.sum(grid_samples) / length(grid_samples),
+  grid_sample_min: Enum.min(grid_samples),
+  grid_sample_max: Enum.max(grid_samples)
+}
+```
+
+## What This Tells You
+
+* **The posterior is the answer.** Not a point estimate, not a confidence
+  interval — the entire density. Anything else (mean, median, intervals,
+  log-odds) is a *function* of the posterior.
+* **Conjugacy is a convenience, not a requirement.** When the math works
+  out, use it. When it doesn't, grid + Monte Carlo + (later) MCMC.
+* **Priors matter at small `n` and matter little at large `n`.** A 1000-prior
+  pseudo-observation barely moves a 980-real-observation likelihood — and
+  fades to noise as `n → ∞`. Calibrate your priors against the strength of
+  the evidence you expect.
+* **Sampling is the universal currency.** Once you can draw from a posterior,
+  you can compute expectations of any function of the parameter. Every
+  sampler in eXMC — NUTS, importance sampling, particle filters — sits on
+  this single insight.
+
+## Study Guide
+
+Each exercise is anchored to a specific cell above. Modify it, re-run the
+notebook, and answer the question.
+
+1. **Re-derive the posterior with `(y, n) = (43, 98)`** (the same proportion,
+   one tenth the data). How does the 95% interval change? Is the baseline of
+   0.485 inside the new interval? Modify the second code cell.
+
+2. **The posterior with the strong prior `Beta(485, 515)`** still sits below
+   the baseline. By how much? Compute `P(θ < 0.485 | y, n)` using the
+   conjugate update from Demo 2 and compare to the uniform-prior answer.
+
+3. **Compare the Monte Carlo log-odds estimate from Demo 3** to the exact
+   value `log(α / β) = log(438/544)` (which is the log of the posterior
+   mean's odds, *not* the mean of the log-odds — they differ slightly due
+   to Jensen's inequality). Increase `n_samples` to 50,000 and check
+   convergence.
+
+4. **Replace the triangular prior** in Demo 4 with a triangular prior peaked
+   at 0.40 instead of 0.485. Where does the posterior sit now? Is it pulled
+   left (toward your prior) or held in place (by the data)?
+
+5. **(Optional, harder.)** Compute `P(θ < 0.485 | y, n)` from the *grid*
+   posterior in Demo 4, by summing posterior mass below the threshold.
+   Compare to the conjugate answer.
+
+## Literature
+
+* **Gelman, Carlin, Stern, Dunson, Vehtari, Rubin.** *Bayesian Data
+  Analysis*, 3rd ed., §2.4 (placenta previa example, p. 37–39). The
+  authoritative reference for everything in this notebook.
+* **Vehtari, A.** [BDA Aalto course](https://github.com/avehtari/BDA_course_Aalto)
+  — lecture videos and reading list. Chapter 2 covers exactly this.
+* **Original demos** (Python): `bda-ex-demos/demos_ch2/demo2_{1..4}.ipynb`.
+
+### Where to Go Next
+
+* `notebooks/01_getting_started.livemd` — same Beta-binomial idea via
+  `Sampler.sample` instead of analytical conjugacy. The point: NUTS gets the
+  same answer.
+* `notebooks/bda/ch03_normal_and_bioassay.livemd` — same template applied to
+  unknown variance and a 2D logistic posterior. The grid trick from Demo 4
+  reappears in 2D.
+* `notebooks/bda/ch05_eight_schools.livemd` — when conjugacy and grids stop
+  scaling, NUTS takes over. The 8-schools model is the canonical hierarchical
+  test.

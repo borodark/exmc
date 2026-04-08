@@ -1,0 +1,473 @@
+# BDA Chapter 11 — Gibbs and Metropolis from Scratch
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Chapter 10 gave you two non-Markov samplers (rejection, importance) and
+showed why they don't survive in high dimensions. The fix everyone uses
+is **Markov Chain Monte Carlo**: build a Markov chain whose **stationary
+distribution** is the target posterior, then walk it. After enough steps,
+the chain visits each region of the posterior in proportion to its
+density. The cost is that consecutive samples are autocorrelated — but
+the cost is finite and predictable, and it does not blow up
+exponentially with dimension.
+
+The two foundational MCMC algorithms are **Gibbs sampling** and
+**Metropolis sampling**. Every modern sampler — including NUTS — descends
+from one of them. Implementing both from scratch in Elixir is the
+cheapest way to internalize:
+
+1. The stationary-distribution argument that makes MCMC work.
+2. Why Gibbs needs full conditionals and Metropolis needs only
+   evaluations of the log density.
+3. Why both algorithms still struggle with the funnel from Ch 5, and
+   what NUTS had to invent to escape.
+
+This chapter targets a 2D correlated normal — small, fully tractable, with
+a known answer. If your sampler can't recover this distribution, it can't
+recover anything.
+
+## The Target
+
+A bivariate normal with correlation 0.8:
+
+$$
+\begin{pmatrix} \theta_1 \\ \theta_2 \end{pmatrix}
+\sim \mathrm{Normal}\!\left(
+\begin{pmatrix} 0 \\ 0 \end{pmatrix},\;
+\begin{pmatrix} 1 & 0.8 \\ 0.8 & 1 \end{pmatrix}
+\right)
+$$
+
+This is the toy that BDA Ch 11 uses for both demos. It's small enough
+that you can grid-evaluate the answer for comparison, and structured
+enough (correlated, not independent) that lazy implementations of Gibbs
+and Metropolis fail in interesting ways.
+
+```elixir
+mu1 = 0.0
+mu2 = 0.0
+rho = 0.8
+sigma1 = 1.0
+sigma2 = 1.0
+
+# Log target — unnormalized bivariate normal
+defmodule Target do
+  def log_pdf(t1, t2, mu1, mu2, s1, s2, rho) do
+    z1 = (t1 - mu1) / s1
+    z2 = (t2 - mu2) / s2
+    quad = (z1 * z1 - 2 * rho * z1 * z2 + z2 * z2) / (1 - rho * rho)
+    -0.5 * quad
+  end
+end
+```
+
+## Method 1 — Gibbs Sampling
+
+### The Idea
+
+Gibbs alternates between sampling each parameter from its **full
+conditional** distribution, holding all the others fixed. For a bivariate
+normal, the full conditionals are themselves normals — the math is in
+BDA3 §A.1, but you can derive it in three lines:
+
+$$
+\begin{aligned}
+\theta_1 \mid \theta_2 & \sim \mathrm{Normal}\!\left(\mu_1 + \rho\,\tfrac{\sigma_1}{\sigma_2}(\theta_2 - \mu_2),\; \sigma_1\sqrt{1-\rho^2}\right) \\
+\theta_2 \mid \theta_1 & \sim \mathrm{Normal}\!\left(\mu_2 + \rho\,\tfrac{\sigma_2}{\sigma_1}(\theta_1 - \mu_1),\; \sigma_2\sqrt{1-\rho^2}\right).
+\end{aligned}
+$$
+
+So one Gibbs sweep is:
+
+1. Sample `θ_1` from `Normal(...|θ_2)`.
+2. Sample `θ_2` from `Normal(...|θ_1)`.
+
+That's it. No proposal, no acceptance step. **Every sample is accepted by
+construction** because each conditional is sampled exactly. Gibbs is the
+"easy mode" of MCMC — when full conditionals are available.
+
+### Implementation
+
+```elixir
+defmodule Gibbs do
+  @doc """
+  Gibbs sampling for a bivariate normal. Returns `n` samples as a list of
+  `{t1, t2}` tuples.
+  """
+  def sample(n, mu1, mu2, s1, s2, rho, t1_init, t2_init, rng) do
+    do_step(n, mu1, mu2, s1, s2, rho, t1_init, t2_init, rng, [])
+  end
+
+  defp do_step(0, _, _, _, _, _, _, _, rng, acc), do: {Enum.reverse(acc), rng}
+
+  defp do_step(remaining, mu1, mu2, s1, s2, rho, t1, t2, rng, acc) do
+    # Conditional mean and variance for θ_1 | θ_2
+    cond_mu1 = mu1 + rho * s1 / s2 * (t2 - mu2)
+    cond_s1 = s1 * :math.sqrt(1 - rho * rho)
+    {z, rng} = :rand.normal_s(rng)
+    new_t1 = cond_mu1 + cond_s1 * z
+
+    # Conditional mean and variance for θ_2 | θ_1
+    cond_mu2 = mu2 + rho * s2 / s1 * (new_t1 - mu1)
+    cond_s2 = s2 * :math.sqrt(1 - rho * rho)
+    {z, rng} = :rand.normal_s(rng)
+    new_t2 = cond_mu2 + cond_s2 * z
+
+    do_step(
+      remaining - 1,
+      mu1,
+      mu2,
+      s1,
+      s2,
+      rho,
+      new_t1,
+      new_t2,
+      rng,
+      [{new_t1, new_t2} | acc]
+    )
+  end
+end
+```
+
+### Run It
+
+```elixir
+seed_state = :rand.seed_s(:exsss, 42)
+n_iter = 2_000
+
+{gibbs_samples, _} =
+  Gibbs.sample(n_iter, mu1, mu2, sigma1, sigma2, rho, -2.5, 2.5, seed_state)
+
+gibbs_data =
+  gibbs_samples
+  |> Enum.with_index()
+  |> Enum.map(fn {{t1, t2}, i} -> %{iter: i, t1: t1, t2: t2} end)
+
+# Statistics
+gibbs_mean_t1 = Enum.reduce(gibbs_samples, 0.0, fn {t1, _}, a -> a + t1 end) / n_iter
+gibbs_mean_t2 = Enum.reduce(gibbs_samples, 0.0, fn {_, t2}, a -> a + t2 end) / n_iter
+
+gibbs_corr =
+  Enum.reduce(gibbs_samples, 0.0, fn {t1, t2}, a ->
+    a + (t1 - gibbs_mean_t1) * (t2 - gibbs_mean_t2)
+  end) / n_iter
+
+%{
+  mean_t1: Float.round(gibbs_mean_t1, 3),
+  mean_t2: Float.round(gibbs_mean_t2, 3),
+  empirical_correlation: Float.round(gibbs_corr, 3),
+  target_mean: 0.0,
+  target_correlation: 0.8
+}
+```
+
+The empirical means should be close to 0 and the empirical correlation
+close to 0.8. Gibbs converges fast for this target because it's well
+conditioned and the full conditionals exist in closed form.
+
+```elixir
+target_grid =
+  for t1 <- Nx.linspace(-3.5, 3.5, n: 50) |> Nx.to_list(),
+      t2 <- Nx.linspace(-3.5, 3.5, n: 50) |> Nx.to_list() do
+    %{t1: t1, t2: t2, density: :math.exp(Target.log_pdf(t1, t2, 0.0, 0.0, 1.0, 1.0, 0.8))}
+  end
+
+contour =
+  Vl.new()
+  |> Vl.data_from_values(target_grid)
+  |> Vl.mark(:rect)
+  |> Vl.encode_field(:x, "t1", type: :quantitative, bin: %{maxbins: 50})
+  |> Vl.encode_field(:y, "t2", type: :quantitative, bin: %{maxbins: 50})
+  |> Vl.encode_field(:color, "density", type: :quantitative, scale: %{scheme: "blues"})
+
+samples_layer =
+  Vl.new()
+  |> Vl.data_from_values(gibbs_data |> Enum.take(500))
+  |> Vl.mark(:circle, color: "#e45756", size: 14, opacity: 0.6)
+  |> Vl.encode_field(:x, "t1", type: :quantitative)
+  |> Vl.encode_field(:y, "t2", type: :quantitative)
+
+Vl.new(width: 480, height: 480, title: "Gibbs samples over target density")
+|> Vl.layers([contour, samples_layer])
+```
+
+### What Goes Wrong
+
+Gibbs **steps along axes**. When the target is correlated, axis-aligned
+steps make slow progress along the long axis of the ellipse. Increase
+`rho` to 0.99 — Gibbs starts to crawl. With `rho = 0.999`, Gibbs takes
+thousands of iterations to traverse the ridge. The cure is reparameterization
+(rotate so the axes align with the target) or switching to a proposal that
+respects the correlation (Metropolis with a tuned proposal, or
+Hamiltonian dynamics).
+
+Gibbs also breaks down whenever **full conditionals don't have a closed
+form**. The bioassay model from Ch 3 is a typical case — there's no
+analytical full conditional for `α | β, y` because the binomial likelihood
+doesn't conjugate to anything nice.
+
+That's why every general-purpose modern PPL (PyMC, Stan, eXMC) uses
+Hamiltonian methods instead. Gibbs is still useful for very specific
+hierarchical models with explicit conjugate structure (LDA, some genomics
+models), but it is no longer the default.
+
+## Method 2 — Metropolis Sampling
+
+### The Idea
+
+Metropolis only requires that you can **evaluate** the unnormalized target
+`q(θ)`. No closed-form conditionals needed. The procedure:
+
+1. Start at `θ_current`.
+2. Propose `θ_proposed = θ_current + ε` where `ε ~ Normal(0, jump_sigma)`.
+3. Compute the ratio `r = q(θ_proposed) / q(θ_current)`.
+4. Sample `u ~ Uniform(0, 1)`. Accept the proposal if `u < r`, otherwise
+   stay at `θ_current`.
+
+This is symmetric Metropolis. The Metropolis-Hastings extension adds an
+asymmetric proposal correction; Stan, NUTS, and most modern samplers use
+that. The core insight — **propose, evaluate ratio, accept or stay** — is
+the same.
+
+### Implementation
+
+```elixir
+defmodule Metropolis do
+  @doc """
+  Symmetric Metropolis sampler for an arbitrary 2D target. Proposal is
+  Normal(current, jump_sigma·I).
+
+  Returns `{samples, accept_count}`.
+  """
+  def sample(n, log_target, t1_init, t2_init, jump_sigma, rng) do
+    log_q_current = log_target.(t1_init, t2_init)
+    do_step(n, log_target, t1_init, t2_init, log_q_current, jump_sigma, rng, [], 0)
+  end
+
+  defp do_step(0, _, _, _, _, _, rng, acc, accepts), do: {Enum.reverse(acc), accepts, rng}
+
+  defp do_step(remaining, log_target, t1, t2, log_q, jump_sigma, rng, acc, accepts) do
+    {z1, rng} = :rand.normal_s(rng)
+    {z2, rng} = :rand.normal_s(rng)
+    new_t1 = t1 + jump_sigma * z1
+    new_t2 = t2 + jump_sigma * z2
+
+    log_q_new = log_target.(new_t1, new_t2)
+    log_r = log_q_new - log_q
+
+    {u, rng} = :rand.uniform_s(rng)
+
+    {next_t1, next_t2, next_log_q, accept} =
+      if :math.log(u) < log_r do
+        {new_t1, new_t2, log_q_new, 1}
+      else
+        {t1, t2, log_q, 0}
+      end
+
+    do_step(
+      remaining - 1,
+      log_target,
+      next_t1,
+      next_t2,
+      next_log_q,
+      jump_sigma,
+      rng,
+      [{next_t1, next_t2} | acc],
+      accepts + accept
+    )
+  end
+end
+```
+
+### Run It (Three Jump Sizes)
+
+The proposal scale `jump_sigma` is the only tuning knob, but it
+controls everything. Too small and the chain crawls (high acceptance,
+high autocorrelation, slow exploration). Too large and proposals are
+almost always rejected (low acceptance, chain stuck for long stretches).
+The Goldilocks zone is **acceptance rate around 0.2-0.4** for moderate
+dimensions.
+
+```elixir
+log_target = fn t1, t2 ->
+  Target.log_pdf(t1, t2, mu1, mu2, sigma1, sigma2, rho)
+end
+
+scenarios = [
+  {0.1, "Too small"},
+  {0.5, "Just right"},
+  {3.0, "Too large"}
+]
+
+results =
+  for {jump, label} <- scenarios do
+    seed_state = :rand.seed_s(:exsss, 42)
+    {samples, accepts, _} = Metropolis.sample(2_000, log_target, -2.5, 2.5, jump, seed_state)
+
+    %{
+      jump_sigma: jump,
+      label: label,
+      acceptance_rate: Float.round(accepts / 2_000, 3),
+      samples: samples
+    }
+  end
+
+Enum.map(results, fn r -> Map.take(r, [:jump_sigma, :label, :acceptance_rate]) end)
+```
+
+The "too small" scenario should accept ~95% of proposals (almost
+everything looks good because moves are tiny) but the chain barely moves.
+The "too large" scenario should accept ~5% (almost everything is rejected
+because the chain leaps off the high-density ridge). The "just right"
+scenario should accept ~30-40% and explore the target efficiently.
+
+```elixir
+combined =
+  results
+  |> Enum.flat_map(fn r ->
+    r.samples
+    |> Enum.take(1_000)
+    |> Enum.map(fn {t1, t2} -> %{t1: t1, t2: t2, scenario: "#{r.label} (σ=#{r.jump_sigma})"} end)
+  end)
+
+Vl.new(width: 600, height: 400, title: "Metropolis: effect of proposal scale")
+|> Vl.data_from_values(combined)
+|> Vl.mark(:circle, size: 12, opacity: 0.5)
+|> Vl.encode_field(:x, "t1", type: :quantitative)
+|> Vl.encode_field(:y, "t2", type: :quantitative)
+|> Vl.encode_field(:color, "scenario", type: :nominal)
+```
+
+You should see three clouds: one tightly bunched (too small — never
+escapes the starting region), one well distributed (just right), one
+sparse and clumpy (too large — long stuck periods between rare jumps).
+
+### Trace Plots — The Diagnostic
+
+```elixir
+just_right = Enum.find(results, &(&1.label == "Just right"))
+
+trace_data =
+  just_right.samples
+  |> Enum.with_index()
+  |> Enum.flat_map(fn {{t1, t2}, i} ->
+    [
+      %{iter: i, value: t1, parameter: "θ_1"},
+      %{iter: i, value: t2, parameter: "θ_2"}
+    ]
+  end)
+
+Vl.new(width: 600, height: 240, title: "Metropolis trace plots (just right)")
+|> Vl.data_from_values(trace_data)
+|> Vl.mark(:line, opacity: 0.8)
+|> Vl.encode_field(:x, "iter", type: :quantitative)
+|> Vl.encode_field(:y, "value", type: :quantitative)
+|> Vl.encode_field(:color, "parameter", type: :nominal)
+```
+
+A healthy Metropolis trace looks like fuzz around the mean, with the
+chain visiting all parts of its range repeatedly. A pathological trace
+either drifts (not converged) or sits flat (stuck). With `rho = 0.8`,
+even just-right Metropolis takes a few hundred iterations to mix
+properly — visible as the slow oscillation of the trace at the start.
+
+## What This Tells You
+
+- **Gibbs is exact-conditional MCMC.** No tuning, no acceptance rate.
+  Wonderful when full conditionals are tractable. Useless when they're
+  not, and slow when the target is highly correlated and Gibbs has to
+  step axis-by-axis.
+- **Metropolis is the most general MCMC algorithm.** It needs only
+  evaluations of the unnormalized target. The price is the proposal
+  tuning — too small wastes time, too large rejects everything.
+- **The proposal-tuning problem is the entire reason Hamiltonian
+  methods exist.** HMC and NUTS use the *gradient* of the log target to
+  craft proposals that respect local geometry, eliminating the manual
+  scale tuning that plagues Metropolis.
+- **All MCMC samples are autocorrelated.** Effective sample size is
+  always less than nominal sample size. Watch the trace plot, watch
+  the autocorrelation, watch R-hat across multiple chains.
+- **Stationary distribution arguments are abstract; trace plots are
+  not.** Always look at your traces.
+
+## Study Guide
+
+1. **Push the correlation up.** Set `rho = 0.99`. Re-run Gibbs and
+   Metropolis. Which one degrades faster? Why?
+
+2. **Tune Metropolis to a target acceptance rate of 0.234** (the
+   asymptotically optimal rate for symmetric Metropolis on smooth
+   targets, due to Roberts, Gelman & Gilks 1997). Find the `jump_sigma`
+   that achieves it on the bivariate normal. Compare effective sample
+   size to your initial "just right" choice.
+
+3. **Implement Metropolis-within-Gibbs** for the bioassay posterior from
+   Ch 3. Use Gibbs scaffolding (alternate between updating `α` and `β`)
+   but use a Metropolis step for each (because there's no analytical
+   conditional). Compare to the grid posterior.
+
+4. **Compute the autocorrelation function** of the Gibbs and Metropolis
+   chains. At what lag does it drop below 0.1 for each? That gives you
+   the *effective* sample size: `n_eff ≈ n / (1 + 2 Σ ρ_k)`.
+
+5. **(Hard.)** Implement Hamiltonian Monte Carlo on the same bivariate
+   normal target. You'll need a leapfrog integrator. Compare ESS to
+   Metropolis at the same wall time. eXMC's `lib/exmc/nuts/leapfrog.ex`
+   is a useful reference.
+
+6. **(Hard.)** Run Gibbs and Metropolis on the 8-schools posterior from
+   Ch 5 (centered parameterization). Watch them fail in the funnel.
+   Compare to NUTS with NCP via `Sampler.sample(ir, init, ncp: true)`.
+   This is the experiment that motivated the entire NUTS line of
+   research.
+
+## Literature
+
+- **Gelman et al.** *Bayesian Data Analysis*, 3rd ed., §11.1–11.4
+  (Gibbs and Metropolis, with the bivariate normal example).
+- **Hastings, W. K. (1970).** "Monte Carlo sampling methods using Markov
+  chains and their applications." *Biometrika* 57. The original M-H
+  paper.
+- **Geman, S. & Geman, D. (1984).** "Stochastic relaxation, Gibbs
+  distributions, and the Bayesian restoration of images." *IEEE PAMI* 6.
+  The original Gibbs paper, in image processing.
+- **Roberts, G. O., Gelman, A., Gilks, W. R. (1997).** "Weak convergence
+  and optimal scaling of random walk Metropolis algorithms." *Annals of
+  Applied Probability* 7. The 0.234 acceptance rate result.
+- **Hoffman, M. & Gelman, A. (2014).** "The No-U-Turn Sampler." *JMLR* 15.
+  Why HMC needed something on top of Metropolis.
+- **Original Python demos:** `bda-ex-demos/demos_ch11/demo11_{1,2}.ipynb`.
+
+### Where to Go Next
+
+- `notebooks/bda/ch05_eight_schools.livemd` — the funnel that Gibbs and
+  Metropolis cannot navigate, and the NUTS+NCP experiment that
+  empirically demolishes them.
+- `notebooks/01_getting_started.livemd` — the same NUTS sampler used as
+  a black box, now with the appreciation that *what's inside the box* is
+  HMC built on top of the lessons in this chapter.
+- `notebooks/bda/ch10_rejection_importance.livemd` — the
+  non-Markov alternatives, useful for low-dimensional and embarrassingly
+  parallel use cases.

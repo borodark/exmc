@@ -1,0 +1,419 @@
+# BDA Chapter 4 — Normal (Laplace) Approximation
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Sampling from a posterior is the gold standard. It is also the slow
+standard. Many problems have **so many parameters** that drawing 1000 NUTS
+samples is too expensive — credit risk models with thousands of borrowers,
+neural networks with millions of weights, real-time inference loops where a
+human is waiting. For these you want something cheap that still answers
+"where does the posterior live and how spread out is it?"
+
+The **Laplace approximation** is the cheapest answer. Two steps:
+
+1. Find the mode `θ̂` of the posterior (any optimizer).
+2. Compute the curvature (negative Hessian of `log p`) at that mode and
+   invert it. That is the covariance.
+
+The result is a multivariate normal `N(θ̂, H^{-1})` centered at the mode.
+It is **exact when the posterior is itself normal** and is a useful first
+guess for any unimodal posterior. When it fails, it tells you something
+useful about the posterior's geometry.
+
+This chapter applies Laplace to the bioassay posterior from Chapter 3 and
+compares the approximate normal to the exact grid posterior. The
+approximation is good but not perfect — the grid posterior has a mild
+banana shape that the normal can't capture, and some samples leak into
+`β < 0` territory that the true posterior assigns essentially zero mass.
+That mild failure is the lesson.
+
+## The Bioassay Posterior (recap)
+
+Same data as Ch 3 §3:
+
+```elixir
+bx = [-0.86, -0.30, -0.05, 0.73]
+bn = [5, 5, 5, 5]
+by = [0, 1, 3, 5]
+
+defmodule Bioassay do
+  @moduledoc """
+  Log-posterior of (α, β) under uniform prior, plus its analytical gradient.
+  """
+
+  def log_posterior(alpha, beta, xs, ns, ys) do
+    Enum.zip([xs, ns, ys])
+    |> Enum.reduce(0.0, fn {x, n, y}, acc ->
+      logit = alpha + beta * x
+      log_p = -log1pexp(-logit)
+      log_1mp = -log1pexp(logit)
+      acc + y * log_p + (n - y) * log_1mp
+    end)
+  end
+
+  @doc """
+  Analytical gradient of log p w.r.t. (α, β). Used for Newton's method.
+  """
+  def gradient(alpha, beta, xs, ns, ys) do
+    Enum.zip([xs, ns, ys])
+    |> Enum.reduce({0.0, 0.0}, fn {x, n, y}, {ga, gb} ->
+      p = sigmoid(alpha + beta * x)
+      d = y - n * p
+      {ga + d, gb + d * x}
+    end)
+  end
+
+  defp sigmoid(z) when z > 0, do: 1.0 / (1.0 + :math.exp(-z))
+  defp sigmoid(z), do: :math.exp(z) / (1.0 + :math.exp(z))
+
+  defp log1pexp(x) when x > 0, do: x + :math.log(1.0 + :math.exp(-x))
+  defp log1pexp(x), do: :math.log(1.0 + :math.exp(x))
+end
+```
+
+## Step 1 — Find the Mode
+
+Use Newton's method on `-log p`. Newton needs the gradient and the Hessian.
+For the bioassay model both have closed forms (binomial/logistic), but the
+Hessian is small enough to compute by central finite differences against
+the analytical gradient — that way you can drop in any other model later.
+
+```elixir
+defmodule Optim do
+  @doc """
+  Numerical Hessian of `log p(α, β)` via central differences on the analytical gradient.
+  Returns the 2x2 matrix of second partials.
+  """
+  def hessian(alpha, beta, xs, ns, ys, h \\ 1.0e-4) do
+    {ga_p, gb_p} = Bioassay.gradient(alpha + h, beta, xs, ns, ys)
+    {ga_m, gb_m} = Bioassay.gradient(alpha - h, beta, xs, ns, ys)
+    haa = (ga_p - ga_m) / (2 * h)
+    hba = (gb_p - gb_m) / (2 * h)
+
+    {ga_p2, gb_p2} = Bioassay.gradient(alpha, beta + h, xs, ns, ys)
+    {ga_m2, gb_m2} = Bioassay.gradient(alpha, beta - h, xs, ns, ys)
+    hab = (ga_p2 - ga_m2) / (2 * h)
+    hbb = (gb_p2 - gb_m2) / (2 * h)
+
+    # Symmetrize off-diagonals
+    off = (hba + hab) / 2
+    {haa, off, off, hbb}
+  end
+
+  @doc """
+  Newton's method: maximize log p by following H^{-1}·∇.
+  Returns the mode after `max_iter` iterations.
+  """
+  def newton(alpha0, beta0, xs, ns, ys, max_iter \\ 50) do
+    Enum.reduce(1..max_iter, {alpha0, beta0}, fn _, {a, b} ->
+      {ga, gb} = Bioassay.gradient(a, b, xs, ns, ys)
+      {haa, hab, _, hbb} = hessian(a, b, xs, ns, ys)
+
+      # Hessian of log p is negative definite; we want to climb, so step is -H^{-1}·∇
+      # But since we're maximizing, equivalently solve H·δ = -∇ where H is the Hessian.
+      det = haa * hbb - hab * hab
+      d_alpha = (hbb * ga - hab * gb) / det
+      d_beta = (-hab * ga + haa * gb) / det
+
+      {a - d_alpha, b - d_beta}
+    end)
+  end
+end
+```
+
+```elixir
+{mode_a, mode_b} = Optim.newton(0.0, 0.0, bx, bn, by)
+{haa, hab, _, hbb} = Optim.hessian(mode_a, mode_b, bx, bn, by)
+
+%{
+  mode_alpha: Float.round(mode_a, 4),
+  mode_beta: Float.round(mode_b, 4),
+  hessian_aa: Float.round(haa, 3),
+  hessian_ab: Float.round(hab, 3),
+  hessian_bb: Float.round(hbb, 3)
+}
+```
+
+The Hessian of `log p` is negative definite at the mode — `Haa < 0`,
+`Hbb < 0`, and the determinant `Haa·Hbb − Hab² > 0`. Its negative inverse
+is the **covariance matrix of the Laplace approximation**.
+
+## Step 2 — Build the Normal Approximation
+
+```elixir
+# Covariance = -H^{-1}
+det_h = haa * hbb - hab * hab
+cov_aa = -hbb / det_h
+cov_ab = hab / det_h
+cov_bb = -haa / det_h
+
+# Sd of marginals + correlation (just for inspection)
+sd_a = :math.sqrt(cov_aa)
+sd_b = :math.sqrt(cov_bb)
+corr_ab = cov_ab / (sd_a * sd_b)
+
+%{
+  mode_alpha: Float.round(mode_a, 3),
+  mode_beta: Float.round(mode_b, 3),
+  posterior_sd_alpha: Float.round(sd_a, 3),
+  posterior_sd_beta: Float.round(sd_b, 3),
+  correlation: Float.round(corr_ab, 3)
+}
+```
+
+The correlation between `α` and `β` is positive and large — typically
+around 0.6–0.8. This is the diagonal-tilt geometry from Ch 3 expressed in
+two numbers. A diagonal mass matrix in NUTS would *miss* this; that's why
+NUTS supports dense mass matrices, and that's why Laplace's full
+covariance gets the geometry right by construction.
+
+### Drawing Samples from the Approximation
+
+To sample from `N(θ̂, Σ)`, draw `z ~ N(0, I)` and apply
+`θ = θ̂ + L·z` where `L` is the Cholesky factor of `Σ`. With a 2×2 matrix,
+Cholesky is two lines.
+
+```elixir
+# Cholesky of 2x2 covariance: L = [[L11, 0], [L21, L22]]
+l11 = :math.sqrt(cov_aa)
+l21 = cov_ab / l11
+l22 = :math.sqrt(cov_bb - l21 * l21)
+
+seed_state = :rand.seed_s(:exsss, 42)
+n_laplace = 1_500
+
+{laplace_samples, _} =
+  Enum.reduce(1..n_laplace, {[], seed_state}, fn _, {acc, rng} ->
+    {z1, rng} = :rand.normal_s(rng)
+    {z2, rng} = :rand.normal_s(rng)
+    a = mode_a + l11 * z1
+    b = mode_b + l21 * z1 + l22 * z2
+    {[%{alpha: a, beta: b} | acc], rng}
+  end)
+
+laplace_samples = Enum.reverse(laplace_samples)
+
+%{
+  laplace_alpha_mean: Enum.reduce(laplace_samples, 0.0, &(&1.alpha + &2)) / n_laplace,
+  laplace_beta_mean: Enum.reduce(laplace_samples, 0.0, &(&1.beta + &2)) / n_laplace,
+  laplace_beta_negative_count: Enum.count(laplace_samples, &(&1.beta < 0))
+}
+```
+
+The number of `β < 0` samples is the **price of the approximation**. The
+true posterior assigns near-zero mass to `β < 0` because the data clearly
+indicate increasing mortality with dose. The normal approximation has
+unbounded support, so it leaks a few percent of its mass into the
+biologically nonsensical region. Whether that matters depends on your use
+case — for the LD50 calculation it absolutely does, because LD50 = -α/β
+explodes when `β` crosses zero.
+
+```elixir
+laplace_data =
+  Enum.map(laplace_samples, fn s -> %{alpha: s.alpha, beta: s.beta} end)
+
+mode_marker = [%{alpha: mode_a, beta: mode_b}]
+
+scatter =
+  Vl.new(width: 500, height: 380, title: "Laplace approximation samples")
+  |> Vl.layers([
+    Vl.new()
+    |> Vl.data_from_values(laplace_data)
+    |> Vl.mark(:circle, size: 14, opacity: 0.5, color: "#4c78a8")
+    |> Vl.encode_field(:x, "alpha", type: :quantitative, title: "α")
+    |> Vl.encode_field(:y, "beta", type: :quantitative, title: "β"),
+    Vl.new()
+    |> Vl.data_from_values(mode_marker)
+    |> Vl.mark(:point, color: "#e45756", size: 200, shape: "cross")
+    |> Vl.encode_field(:x, "alpha", type: :quantitative)
+    |> Vl.encode_field(:y, "beta", type: :quantitative)
+  ])
+
+scatter
+```
+
+The red cross marks the posterior mode. The cloud of blue points is the
+Laplace approximation. The cloud is symmetric around the mode by
+construction — every Laplace approximation looks like an ellipse.
+
+## Comparing Laplace to the Grid
+
+The grid posterior from Ch 3 is the gold standard for this 2-parameter
+problem. Recompute it briefly so we can overlay.
+
+```elixir
+ngrid = 100
+a_vals = Nx.linspace(-4.0, 8.0, n: ngrid) |> Nx.to_list()
+b_vals = Nx.linspace(-10.0, 40.0, n: ngrid) |> Nx.to_list()
+
+flat_log =
+  for a <- a_vals, b <- b_vals do
+    Bioassay.log_posterior(a, b, bx, bn, by)
+  end
+
+max_log = Enum.max(flat_log)
+flat_p = Enum.map(flat_log, &:math.exp(&1 - max_log))
+total = Enum.sum(flat_p)
+flat_p = Enum.map(flat_p, &(&1 / total))
+
+# Sample from the flat grid
+{cdf, _} =
+  Enum.map_reduce(flat_p, 0.0, fn p, acc ->
+    new = acc + p
+    {new, new}
+  end)
+
+dx_a = Enum.at(a_vals, 1) - Enum.at(a_vals, 0)
+dx_b = Enum.at(b_vals, 1) - Enum.at(b_vals, 0)
+
+seed_state = :rand.seed_s(:exsss, 99)
+
+{grid_samples, _} =
+  Enum.reduce(1..n_laplace, {[], seed_state}, fn _, {acc, rng} ->
+    {u, rng} = :rand.uniform_s(rng)
+    idx = Enum.find_index(cdf, &(&1 >= u)) || ngrid * ngrid - 1
+    i = div(idx, ngrid)
+    j = rem(idx, ngrid)
+    {ja, rng} = :rand.uniform_s(rng)
+    {jb, rng} = :rand.uniform_s(rng)
+    a = Enum.at(a_vals, i) + (ja - 0.5) * dx_a
+    b = Enum.at(b_vals, j) + (jb - 0.5) * dx_b
+    {[%{alpha: a, beta: b, source: "grid"} | acc], rng}
+  end)
+
+grid_samples = Enum.reverse(grid_samples)
+
+laplace_tagged = Enum.map(laplace_samples, &Map.put(&1, :source, "Laplace"))
+
+combined = grid_samples ++ laplace_tagged
+length(combined)
+```
+
+```elixir
+Vl.new(width: 600, height: 400, title: "Grid posterior vs Laplace approximation")
+|> Vl.data_from_values(combined)
+|> Vl.mark(:circle, size: 12, opacity: 0.4)
+|> Vl.encode_field(:x, "alpha", type: :quantitative, title: "α")
+|> Vl.encode_field(:y, "beta", type: :quantitative, title: "β")
+|> Vl.encode_field(:color, "source",
+  type: :nominal,
+  scale: %{domain: ["grid", "Laplace"], range: ["#54a24b", "#4c78a8"]}
+)
+```
+
+Look at the right tail of `β`. The grid samples (green) extend further up
+and slightly to the right — the true posterior is **mildly skewed** because
+the binomial likelihood saturates as `β` grows large (the dose-response
+curve gets steeper without changing the data fit). The Laplace
+approximation is symmetric and underestimates this tail. For point
+estimates and 50% intervals the difference is negligible. For 95%
+intervals it matters.
+
+```elixir
+# Compare summaries
+laplace_betas = Enum.map(laplace_samples, & &1.beta) |> Enum.sort()
+grid_betas = Enum.map(grid_samples, & &1.beta) |> Enum.sort()
+
+q = fn list, p ->
+  i = round(p * (length(list) - 1))
+  Enum.at(list, i)
+end
+
+%{
+  laplace_beta_50: {Float.round(q.(laplace_betas, 0.25), 2), Float.round(q.(laplace_betas, 0.75), 2)},
+  grid_beta_50: {Float.round(q.(grid_betas, 0.25), 2), Float.round(q.(grid_betas, 0.75), 2)},
+  laplace_beta_95: {Float.round(q.(laplace_betas, 0.025), 2), Float.round(q.(laplace_betas, 0.975), 2)},
+  grid_beta_95: {Float.round(q.(grid_betas, 0.025), 2), Float.round(q.(grid_betas, 0.975), 2)}
+}
+```
+
+The 50% intervals should agree closely — Laplace is well calibrated near
+the mode. The 95% intervals diverge: the grid's upper bound is larger
+than Laplace's because the true tail is heavier. This is the **diagnostic
+signal** that tells you whether Laplace is good enough for your use case.
+
+## What This Tells You
+
+- **Laplace is the cheapest legitimate approximation.** A few hundred
+  function evaluations to find the mode, two more to compute the
+  Hessian. No MCMC, no rejection rate, no convergence diagnostic.
+- **It is exact when the posterior is normal.** Linear regression with
+  conjugate priors → Laplace gives the exact answer.
+- **It captures correlation by default.** Diagonal Laplace (just the
+  marginal variances) is wrong whenever parameters are correlated. Use
+  the full inverse Hessian.
+- **It misses skew.** Bioassay's tail in `β` is not Gaussian, and the
+  approximation under-covers there. The fix is either to reparameterize
+  (`β` → `log β`?) or to use a sampler.
+- **It is the right starting point** for any new model. Run Laplace
+  first. If the answer looks reasonable and the curvature is well
+  defined, you may not need MCMC at all.
+
+## Study Guide
+
+1. **Re-derive the LD50 from Laplace samples.** Compare to the grid LD50
+   from Ch 3. Where does the discrepancy come from? (Hint: look at
+   `β < 0` samples.)
+
+2. **Reparameterize bioassay** as `(α, log β)` instead of `(α, β)`. Refit
+   the Laplace approximation in the new coordinates. Does the tail in
+   `β` look more Gaussian now?
+
+3. **Add a normal prior** on `(α, β)`: `α ~ N(0, 4)`, `β ~ N(10, 10)`.
+   Modify `log_posterior` to add the log-prior terms. Refit. How much
+   does the prior shrink the mode? How much does it tighten the
+   covariance?
+
+4. **(Hard.)** Implement Laplace for the windshieldy normal model from
+   Ch 3 with `θ = (μ, log σ)`. The log-σ parameterization is what makes
+   Laplace work for this kind of model. Compare to the analytical
+   factored sampler.
+
+5. **Compare Laplace to NUTS.** Use `Exmc.Sampler.sample` on the same
+   bioassay model (you'll need to add weak normal priors on α and β to
+   make the posterior proper for NUTS). Plot all three sample sets:
+   grid, Laplace, NUTS. Where do they agree, where do they disagree?
+
+## Literature
+
+- **Gelman et al.** *Bayesian Data Analysis*, 3rd ed., §4.1 (normal
+  approximation) and §13.2 (when it works and when it doesn't).
+- **Tierney & Kadane (1986)** — accurate Laplace approximations for
+  posterior moments and marginal densities. The classical reference.
+- **MacKay, D.** *Information Theory, Inference, and Learning Algorithms*,
+  ch. 27 — Laplace's method explained alongside variational inference,
+  with diagrams.
+- **Original Python demo:** `bda-ex-demos/demos_ch4/demo4_1.ipynb`.
+
+### Where to Go Next
+
+- `notebooks/04_variational_inference.livemd` — variational inference is
+  Laplace's smarter sibling: still optimization-based, but minimizes a
+  divergence rather than just expanding around a mode.
+- `notebooks/bda/ch10_rejection_importance.livemd` — what to do when
+  Laplace isn't good enough but full MCMC is too slow.
+- `notebooks/bda/ch05_eight_schools.livemd` — when the posterior is so
+  funnel-shaped that *no* normal approximation works at any
+  parameterization, and you genuinely need NUTS.
