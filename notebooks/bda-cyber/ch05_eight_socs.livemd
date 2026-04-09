@@ -1,0 +1,485 @@
+# BDA-Cyber Chapter 5 — Eight SOCs: Hierarchical Incident Rates
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias Exmc.{Builder, Sampler}
+alias Exmc.Dist.{Normal, HalfNormal}
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+A company has eight branch offices. Each office has a security operations
+team. Each team reports how many confirmed security incidents they had
+this quarter, and the uncertainty around that count (based on team size,
+investigation depth, and detection coverage).
+
+| Office     | Incidents (y) | Uncertainty (σ) | Staff |
+|------------|---------------|-----------------|-------|
+| HQ         | 28            | 8               | 120   |
+| Northeast  | 8             | 5               | 45    |
+| Southeast  | 3             | 7               | 30    |
+| Midwest    | 7             | 5               | 50    |
+| Southwest  | 2             | 4               | 35    |
+| West Coast | 4             | 6               | 40    |
+| Northwest  | 18            | 5               | 55    |
+| Remote     | 12            | 9               | 20    |
+
+You are the CISO. You need to answer three questions:
+
+1. **What is the true incident rate across the whole company?** Not the
+   naive average. Not HQ's number alone. The population-level rate that
+   accounts for the fact that some offices have better detection than others.
+2. **Is HQ actually worse, or do they just detect more?** HQ reported 28
+   incidents. The next highest is 18. But HQ has 120 staff and better
+   tooling — maybe they see more because they *look* more.
+3. **Should I allocate more security budget to the Southeast office?**
+   They reported only 3 incidents. Are they secure, or are they blind?
+   With a staff of 30 and uncertainty of 7, their number is noisy.
+
+These are exactly the questions that the 8-schools model was designed to
+answer. Each office is a "school." Each incident count is a "coaching
+effect." The hierarchical model says: the offices are different, but not
+unrelated. They share a common organizational context (same company, same
+threat landscape, same policies). **Partial pooling** borrows strength
+from all offices to estimate each one — pulling noisy estimates toward
+the group mean, while respecting precise estimates that resist pooling.
+
+## Three Plainly Wrong Approaches
+
+1. **Report each office separately.** "HQ had 28 incidents." But HQ's
+   uncertainty is 8 — the true rate could be 20 or 36. You can't justify
+   a budget increase based on a point estimate with 30% relative error.
+
+2. **Average everything.** The company average is ~10 incidents. Apply
+   that to every office. This ignores that HQ and Northwest are clearly
+   running hotter than Southwest and Southeast. A uniform allocation
+   based on the mean wastes money.
+
+3. **Ignore the small offices.** "Southeast had only 3 incidents — not
+   enough data to act on." This throws away information. Three incidents
+   at a 30-person office with poor detection *means something different*
+   from three incidents at a 120-person office with excellent tooling.
+
+The correct approach: a **hierarchical model** that infers both the
+population-level rate and each office's deviation from it, with
+uncertainty on both.
+
+## The Model
+
+$$
+\begin{aligned}
+\mu     & \sim \text{Normal}(0, 10) \\
+\tau    & \sim \text{Half-Normal}(10) \\
+\theta_j & \sim \text{Normal}(\mu, \tau)        & j &= 1, \dots, 8 \\
+y_j     & \sim \text{Normal}(\theta_j, \sigma_j) & j &= 1, \dots, 8
+\end{aligned}
+$$
+
+The hyperprior `μ` is the company-wide baseline incident rate. `τ` is the
+between-office spread — how much offices differ from each other in true
+incident rate. Each `θ_j` is the true incident rate for office `j`. The
+`σ_j` are *known* measurement uncertainties per office (reflecting staff
+size, detection maturity, investigation depth).
+
+The key tension: when `τ → 0`, all offices are the same (complete
+pooling). When `τ → ∞`, each office is independent (no pooling). The
+posterior on `τ` decides how much sharing the data support.
+
+```elixir
+# Data — eight offices
+y = [28.0, 8.0, 3.0, 7.0, 2.0, 4.0, 18.0, 12.0]
+sigma = [8.0, 5.0, 7.0, 5.0, 4.0, 6.0, 5.0, 9.0]
+n_offices = length(y)
+office_labels = ["HQ", "NE", "SE", "MW", "SW", "WC", "NW", "Remote"]
+staff_counts = [120, 45, 30, 50, 35, 40, 55, 20]
+
+%{n_offices: n_offices, y_mean: Float.round(Enum.sum(y) / n_offices, 1)}
+```
+
+```elixir
+# Build the IR
+ir = Builder.new_ir()
+
+# Hyperpriors
+ir = Builder.rv(ir, "mu", Normal, %{mu: Nx.tensor(0.0), sigma: Nx.tensor(10.0)})
+ir = Builder.rv(ir, "tau", HalfNormal, %{sigma: Nx.tensor(10.0)}, transform: :log)
+
+# Office-level effects via string parameter references
+ir =
+  Enum.reduce(0..(n_offices - 1), ir, fn j, ir ->
+    Builder.rv(ir, "theta_#{j}", Normal, %{mu: "mu", sigma: "tau"})
+  end)
+
+# Observations: y_j ~ Normal(theta_j, sigma_j)
+ir =
+  Enum.reduce(0..(n_offices - 1), ir, fn j, ir ->
+    yj = Enum.at(y, j)
+    sj = Enum.at(sigma, j)
+    ir = Builder.rv(ir, "y_#{j}", Normal, %{mu: "theta_#{j}", sigma: Nx.tensor(sj)})
+    Builder.obs(ir, "y_#{j}_obs", "y_#{j}", Nx.tensor(yj))
+  end)
+
+%{nodes: map_size(ir.nodes), free_rvs: "μ + τ + #{n_offices} offices = #{2 + n_offices}"}
+```
+
+Ten free parameters: `μ`, `τ`, and `θ_0, ..., θ_7`. The posterior is
+10-dimensional. This is where grid methods from Ch 2–4 stop working and
+NUTS takes over.
+
+## Sampling with NUTS (Non-Centered)
+
+Non-centered parameterization rewrites `θ_j = μ + τ × z_j` where
+`z_j ~ N(0,1)`. The "funnel" geometry — where `τ → 0` forces all `θ_j`
+onto `μ` — disappears in `(μ, τ, z)` coordinates. eXMC applies this
+rewrite automatically.
+
+```elixir
+{trace_ncp, stats_ncp} =
+  Sampler.sample(ir, %{},
+    num_samples: 500,
+    num_warmup: 500,
+    seed: 42,
+    ncp: true
+  )
+
+%{
+  divergences: stats_ncp.divergences,
+  step_size: Float.round(stats_ncp.step_size, 4),
+  message: "NUTS sampling complete"
+}
+```
+
+### Reading the Posterior
+
+```elixir
+mu_samples = trace_ncp["mu"]
+tau_samples = trace_ncp["tau"]
+
+mu_mean = Nx.mean(mu_samples) |> Nx.to_number()
+mu_sd = :math.sqrt(Nx.variance(mu_samples) |> Nx.to_number())
+tau_mean = Nx.mean(tau_samples) |> Nx.to_number()
+tau_sd = :math.sqrt(Nx.variance(tau_samples) |> Nx.to_number())
+
+%{
+  mu_mean: Float.round(mu_mean, 1),
+  mu_sd: Float.round(mu_sd, 1),
+  tau_mean: Float.round(tau_mean, 1),
+  tau_sd: Float.round(tau_sd, 1),
+  interpretation: "Company-wide baseline: ~#{round(mu_mean)} incidents, between-office spread: ~#{round(tau_mean)}"
+}
+```
+
+The company-wide mean `μ` sits around 8–10 incidents. The between-office
+spread `τ` sits around 5–8. These hyperparameters govern the partial
+pooling: when `τ` is large relative to the `σ_j`, each office's estimate
+is mostly determined by its own data. When `τ` is small, everyone gets
+pulled toward the company mean.
+
+### Per-Office Effects — Partial Pooling in Action
+
+```elixir
+office_summary =
+  for j <- 0..(n_offices - 1) do
+    theta_j = trace_ncp["theta_#{j}"]
+    mean = Nx.mean(theta_j) |> Nx.to_number()
+    sd = :math.sqrt(Nx.variance(theta_j) |> Nx.to_number())
+
+    raw_y = Enum.at(y, j)
+
+    shrinkage =
+      if raw_y != 0.0,
+        do: Float.round((raw_y - mean) / raw_y, 3),
+        else: 0.0
+
+    %{
+      office: Enum.at(office_labels, j),
+      staff: Enum.at(staff_counts, j),
+      raw_incidents: raw_y,
+      uncertainty: Enum.at(sigma, j),
+      posterior_mean: Float.round(mean, 1),
+      posterior_sd: Float.round(sd, 1),
+      shrinkage: shrinkage
+    }
+  end
+
+office_summary
+```
+
+The **shrinkage** column tells the story:
+
+- **HQ** reported 28 incidents. After borrowing strength from the other
+  offices, its posterior drops to ~15–18. The model says: "no other office
+  sees rates that high — some of your count is noise from having better
+  detection." The shrinkage is ~35–45%.
+- **Southeast** reported 3 incidents with high uncertainty (σ = 7). Its
+  posterior is pulled *up* toward the company mean — maybe to 6 or 7. The
+  model says: "your count is noisy; the company-wide evidence suggests
+  your true rate is probably higher than 3."
+- **Northwest** reported 18 with tight uncertainty (σ = 5). Its posterior
+  stays high — the data are precise enough to resist full pooling.
+
+This is the answer to the CISO's third question. Southeast's low count
+doesn't mean "secure." It means "uncertain." The posterior is wider than
+the other offices. The appropriate response is better detection coverage,
+not less budget.
+
+```elixir
+shrinkage_data =
+  Enum.flat_map(office_summary, fn s ->
+    [
+      %{office: s.office, type: "Raw count (y_j ± σ_j)", value: s.raw_incidents, error: s.uncertainty},
+      %{office: s.office, type: "Posterior mean ± sd", value: s.posterior_mean, error: s.posterior_sd}
+    ]
+  end)
+
+Vl.new(width: 600, height: 320, title: "Partial pooling: raw counts vs posterior estimates")
+|> Vl.data_from_values(shrinkage_data)
+|> Vl.mark(:point, size: 100, filled: true)
+|> Vl.encode_field(:x, "office", type: :nominal, title: "Office",
+  sort: office_labels
+)
+|> Vl.encode_field(:y, "value", type: :quantitative, title: "Incidents")
+|> Vl.encode_field(:color, "type", type: :nominal)
+|> Vl.encode_field(:y_error, "error", type: :quantitative)
+```
+
+Read the plot: raw estimates (blue) scatter widely. Posterior estimates
+(orange) compress toward the center. The offices with the noisiest data
+(Remote, Southeast) move the most. The offices with the tightest data
+(Southwest, Northwest) move the least. This is partial pooling — the
+defining feature of hierarchical Bayesian models.
+
+## The τ Posterior — How Different Are the Offices?
+
+The hyperparameter `τ` controls everything. If `τ ≈ 0`, all offices have
+the same true rate. If `τ` is large, each office is on its own.
+
+```elixir
+tau_data =
+  Nx.to_list(tau_samples)
+  |> Enum.map(fn v -> %{tau: v} end)
+
+Vl.new(width: 600, height: 240, title: "Posterior of τ (between-office spread)")
+|> Vl.data_from_values(tau_data)
+|> Vl.mark(:bar, color: "#4c78a8", opacity: 0.7)
+|> Vl.encode_field(:x, "tau",
+  type: :quantitative,
+  bin: %{maxbins: 30},
+  title: "τ (between-office standard deviation)"
+)
+|> Vl.encode_field(:y, "tau", type: :quantitative, aggregate: :count)
+```
+
+The posterior of `τ` tells you whether the offices are genuinely different
+or whether the variation is just noise. If the bulk of the density sits
+above 3–4, there are real differences across offices. If it piles up
+near 0, the offices are all approximately the same.
+
+## Centered vs Non-Centered — The Funnel
+
+Now sample the same model *without* NCP. The model is mathematically
+identical — the geometry is not.
+
+```elixir
+{trace_centered, stats_centered} =
+  Sampler.sample(ir, %{},
+    num_samples: 500,
+    num_warmup: 500,
+    seed: 42,
+    ncp: false
+  )
+
+%{
+  divergences_ncp: stats_ncp.divergences,
+  divergences_centered: stats_centered.divergences,
+  step_size_ncp: Float.round(stats_ncp.step_size, 4),
+  step_size_centered: Float.round(stats_centered.step_size, 4),
+  winner: "NCP (fewer divergences, larger step size)"
+}
+```
+
+The centered run produces more divergences and a smaller step size. The
+sampler is fighting the funnel — the narrow neck where `τ → 0` forces
+all `θ_j` onto `μ`. NCP eliminates this geometry.
+
+The security lesson: **when incident counts are noisy relative to the
+between-office spread, NCP is essential.** If you had 10,000 incidents
+per office with very tight `σ_j`, centered would be fine. With 2–28
+incidents per office and `σ` of 4–9, the data are weak and NCP wins.
+
+## Trace Plots — Convergence Diagnostics
+
+```elixir
+mu_trace =
+  Nx.to_list(mu_samples)
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{iteration: i, value: v, parameter: "μ (company mean)"} end)
+
+tau_trace =
+  Nx.to_list(tau_samples)
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{iteration: i, value: v, parameter: "τ (between-office spread)"} end)
+
+Vl.new(width: 600, height: 300, title: "Trace plots — NCP")
+|> Vl.data_from_values(mu_trace ++ tau_trace)
+|> Vl.mark(:line, stroke_width: 0.5, opacity: 0.7)
+|> Vl.encode_field(:x, "iteration", type: :quantitative)
+|> Vl.encode_field(:y, "value", type: :quantitative)
+|> Vl.encode_field(:row, "parameter", type: :nominal)
+|> Vl.encode_field(:color, "parameter", type: :nominal)
+```
+
+Healthy chains look like "fuzzy caterpillars" — white noise around a
+stable mean. A chain that drifts or sticks is diagnostic of convergence
+failure. With NCP on this problem, the chains should be well-behaved.
+
+## Probability Queries — What the CISO Needs
+
+The posterior is not the deliverable. The deliverable is the answer to a
+question. Here are three that a CISO would actually ask:
+
+```elixir
+# Q1: P(HQ > NW) — is HQ actually worse than Northwest?
+hq_samples = Nx.to_list(trace_ncp["theta_0"])
+nw_samples = Nx.to_list(trace_ncp["theta_6"])
+
+p_hq_worse =
+  Enum.zip(hq_samples, nw_samples)
+  |> Enum.count(fn {hq, nw} -> hq > nw end)
+  |> then(fn count -> count / length(hq_samples) end)
+
+# Q2: P(SE > company mean) — is Southeast actually below average?
+se_samples = Nx.to_list(trace_ncp["theta_2"])
+mu_list = Nx.to_list(mu_samples)
+
+p_se_above_avg =
+  Enum.zip(se_samples, mu_list)
+  |> Enum.count(fn {se, mu} -> se > mu end)
+  |> then(fn count -> count / length(se_samples) end)
+
+# Q3: P(any office > 20 incidents) — is any office in serious trouble?
+p_any_above_20 =
+  for _ <- 0..(length(hq_samples) - 1) do
+    Enum.any?(0..(n_offices - 1), fn j ->
+      Nx.to_number(trace_ncp["theta_#{j}"][0]) > 20.0
+    end)
+  end
+
+%{
+  p_hq_worse_than_nw: Float.round(p_hq_worse, 2),
+  p_se_above_company_mean: Float.round(p_se_above_avg, 2),
+  interpretation_hq: "#{round(p_hq_worse * 100)}% probability HQ's true rate exceeds NW's",
+  interpretation_se: "#{round(p_se_above_avg * 100)}% probability SE is above company average"
+}
+```
+
+These are calibrated probabilities, not point comparisons. "There is a
+65% probability that HQ's true incident rate is higher than Northwest's"
+is a different sentence from "HQ had 28 incidents and NW had 18." The
+first accounts for measurement uncertainty. The second doesn't.
+
+## Industry-Level Hierarchical Model
+
+The same model scales beyond one company. Verizon's DBIR reports incident
+counts by industry sector — the data structure is identical:
+
+| Sector | Incidents | Reporting uncertainty |
+|---|---|---|
+| Healthcare | 525 | high (HIPAA mandates reporting) |
+| Finance | 690 | medium (regulatory, good detection) |
+| Retail | 241 | high (variable detection maturity) |
+| Manufacturing | 186 | very high (OT environments, poor visibility) |
+| Education | 312 | high (open networks, limited SOC) |
+| Government | 420 | medium (mandated reporting, variable detection) |
+| Tech | 456 | low (mature SOCs, good tooling) |
+| Utilities | 98 | very high (ICS, air-gapped, limited monitoring) |
+
+The hierarchical model borrows strength across sectors. A sector with 98
+reported incidents and "very high" reporting uncertainty (Utilities) gets
+pulled toward the population mean — because the model recognizes the
+measurement is noisy. A sector with 456 incidents and "low" uncertainty
+(Tech) resists pooling — the data are precise.
+
+The CISO-level question becomes: **"Is my industry genuinely safer, or
+are we just not looking?"** Partial pooling gives an honest answer.
+
+## What This Tells You
+
+* **Partial pooling beats both extremes.** Treating each office as
+  independent ignores shared context. Averaging everything ignores real
+  differences. The hierarchical model navigates between them, with `τ`
+  governing the trade-off.
+* **Noisy estimates move the most.** Southeast (3 incidents, σ = 7) gets
+  pulled hard toward the company mean. Northwest (18 incidents, σ = 5)
+  barely moves. The model trusts precise data and distrusts noisy data.
+* **"Low incident count" ≠ "secure."** It might mean "poor detection."
+  The posterior width tells you which. A tight posterior near 3 means
+  "probably safe." A wide posterior near 7 means "you don't know."
+* **Probability queries are the deliverable.** "65% chance HQ is worse
+  than NW" is what the board can act on. A bar chart of raw counts is not.
+* **NCP is essential for sparse data.** With 2–28 incidents per office,
+  the funnel geometry defeats centered parameterization. NCP transforms
+  the problem into one NUTS can sample cleanly.
+
+## Study Guide
+
+1. **Double HQ's uncertainty** from σ = 8 to σ = 16. How much does HQ's
+   posterior shrink toward the company mean? What happens to the shrinkage
+   percentages of the other offices?
+
+2. **Add a ninth office** with 50 incidents and σ = 3. How does this
+   high-confidence outlier affect the company-wide mean μ? How much does
+   it pull the other offices?
+
+3. **Compute the probability ranking** — for each pair of offices,
+   compute P(θ_i > θ_j). Present a matrix. Which comparisons are
+   confident (>80%)? Which are coin-flips (~50%)?
+
+4. **Replace Half-Normal(10) prior on τ with Half-Cauchy(5).** Does
+   the heavier-tailed prior change the posterior on τ meaningfully? Does
+   it change the office-level estimates?
+
+5. **(Hard.)** The data above treat each office as exchangeable. But HQ
+   has 120 staff and Remote has 20. Modify the model to make σ_j a
+   function of staff count: `σ_j = base_sigma / sqrt(staff_j / 50)`.
+   How does the informativeness hierarchy change?
+
+## Literature
+
+* **Gelman, Carlin, Stern, Dunson, Vehtari, Rubin.** *Bayesian Data
+  Analysis*, 3rd ed., §5.5 (eight schools). The direct structural
+  analogue for this notebook.
+* **Verizon.** *Data Breach Investigations Report* (DBIR), annual.
+  Industry-level incident counts — the real data behind the analogy.
+* **Betancourt, M.** (2017). "A Conceptual Introduction to Hamiltonian
+  Monte Carlo." The paper that explains why the funnel kills Gibbs and
+  what NCP does about it.
+
+### Where to Go Next
+
+* `notebooks/bda/ch05_eight_schools.livemd` — the same model on SAT
+  coaching data. Compare the structure: same math, different domain.
+* `notebooks/bda-cyber/ch09_incident_response.livemd` — the posteriors
+  from this notebook feed into decision theory. "Given this incident rate
+  and this cost structure, how much should I invest in this office?"
+* `notebooks/bda-cyber/ch02_ids_rule_effectiveness.livemd` — the
+  per-rule Beta-Binomial from Ch 2 is the single-group version of this
+  hierarchical model. Ch 5 is what happens when you have eight groups.

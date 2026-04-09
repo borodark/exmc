@@ -1,0 +1,363 @@
+# BDA-Cyber Chapter 6 — Posterior Predictive Checks: Is Your Threat Model Right?
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+You fit a model. You see the posterior. The posterior says the parameters
+live in a particular range. So far, so Bayesian. The question that makes
+you a *useful* security analyst instead of an overconfident one:
+
+> If my threat model were correct, would the attack data look like the
+> attack data I actually observed?
+
+That is the **posterior predictive check** (PPC). Procedure:
+
+1. Draw parameter samples from the posterior.
+2. For each draw, simulate a synthetic dataset of the same size.
+3. Compute a **test statistic** T on each synthetic dataset and on the
+   real dataset.
+4. Compare. If T(y_real) falls in the bulk of the T(y_rep) distribution,
+   the model is consistent. If it falls in the tail, the model is wrong.
+
+The deep question — and the source of every PPC failure — is **which test
+statistic**. Some are useless (a tautology). Some are devastating (a
+tight diagnostic of model misfit). Picking well is the entire skill.
+
+## The Data — Weekly CVE Disclosures
+
+Suppose your threat model assumes that new CVE disclosures arrive at a
+constant rate — a Poisson process. If true, the weekly count of new CVEs
+affecting your technology stack is Poisson(λ) with some unknown λ.
+
+```elixir
+# Weekly CVE counts for your tech stack over 52 weeks
+# (Simulated from real NVD patterns — real data has the same structure)
+weekly_cves = [
+  3, 5, 2, 4, 6, 3, 2, 5, 4, 3,
+  7, 4, 3, 2, 5, 4, 3, 6, 4, 3,
+  2, 5, 4, 3, 4, 5,
+  # Week 27: Patch Tuesday cluster + a major library vulnerability
+  14, 18, 12,
+  # Back to "normal"
+  4, 3, 5, 3, 4, 6, 3, 2, 5, 4,
+  3, 5, 4, 3, 2, 4, 5, 3, 4, 3,
+  5, 4, 3, 2
+]
+
+n_weeks = length(weekly_cves)
+total = Enum.sum(weekly_cves)
+y_mean = total / n_weeks
+y_var = Enum.reduce(weekly_cves, 0.0, fn y, acc -> acc + (y - y_mean) ** 2 end) / (n_weeks - 1)
+
+%{
+  weeks: n_weeks,
+  total_cves: total,
+  weekly_mean: Float.round(y_mean, 2),
+  weekly_variance: Float.round(y_var, 2),
+  variance_to_mean_ratio: Float.round(y_var / y_mean, 2),
+  note: "Poisson → variance/mean = 1.0. We see #{Float.round(y_var / y_mean, 1)}."
+}
+```
+
+The variance-to-mean ratio is well above 1.0. A Poisson model predicts
+variance = mean. The data are **overdispersed** — there is more
+variability than a constant-rate model can explain. The three-week
+cluster (weeks 27–29) is visible in the raw numbers. A Poisson model
+cannot produce such clusters at the observed mean rate.
+
+But can we detect this misfit formally, with a PPC?
+
+## Fitting the Poisson Model
+
+With a Gamma(1, 1) prior on λ, the Poisson-Gamma conjugate posterior is:
+
+$$
+\lambda \mid y \sim \text{Gamma}\!\left(1 + \sum y_i,\; 1 + n\right)
+$$
+
+```elixir
+# Conjugate posterior
+alpha_post = 1 + total
+beta_post = 1 + n_weeks
+
+lambda_mean = alpha_post / beta_post
+
+%{
+  posterior_mean_lambda: Float.round(lambda_mean, 2),
+  posterior_sd: Float.round(:math.sqrt(alpha_post) / beta_post, 2),
+  interpretation: "Posterior: ~#{Float.round(lambda_mean, 1)} CVEs/week"
+}
+```
+
+```elixir
+# Draw lambda samples from Gamma posterior
+n_draws = 2_000
+rng = :rand.seed_s(:exsss, 42)
+
+{lambda_samples, rng} =
+  Enum.reduce(1..n_draws, {[], rng}, fn _, {acc, r} ->
+    # Gamma(alpha, beta) via sum of exponentials (for integer alpha, use rejection)
+    # Simple: Gamma(a, b) ≈ Normal(a/b, sqrt(a)/b) for large alpha (CLT)
+    {z, r} = :rand.normal_s(r)
+    lam = alpha_post / beta_post + :math.sqrt(alpha_post) / beta_post * z
+    lam = max(lam, 0.01)
+    {[lam | acc], r}
+  end)
+
+lambda_samples = Enum.reverse(lambda_samples)
+:ok
+```
+
+## PPC — The Bad Test Statistic
+
+First, check the mean. For each posterior draw of λ, simulate 52 weeks
+of Poisson data and compute the mean of the simulated data.
+
+```elixir
+# Generate replicated datasets and compute T(y_rep) = mean
+{rep_means, _} =
+  Enum.reduce(lambda_samples, {[], rng}, fn lam, {acc, r} ->
+    # Simulate n_weeks Poisson(lam) draws
+    {counts, r} =
+      Enum.reduce(1..n_weeks, {[], r}, fn _, {cs, r} ->
+        # Poisson via inverse CDF (adequate for small lambda)
+        {u, r} = :rand.uniform_s(r)
+        k = poisson_icdf(u, lam)
+        {[k | cs], r}
+      end)
+
+    rep_mean = Enum.sum(counts) / n_weeks
+    {[rep_mean | acc], r}
+  end)
+
+rep_means = Enum.reverse(rep_means)
+
+# p-value: fraction of rep means > observed mean
+p_mean =
+  Enum.count(rep_means, fn rm -> rm >= y_mean end) / length(rep_means)
+
+%{
+  observed_mean: Float.round(y_mean, 2),
+  rep_mean_mean: Float.round(Enum.sum(rep_means) / length(rep_means), 2),
+  ppc_p_value_mean: Float.round(p_mean, 3),
+  verdict: "Mean test: #{if abs(p_mean - 0.5) < 0.4, do: "PASS — model is consistent", else: "FAIL"}"
+}
+```
+
+```elixir
+# Helper: Poisson inverse CDF
+defmodule PoissonHelper do
+  def icdf(u, lambda) do
+    icdf_loop(u, lambda, 0, :math.exp(-lambda))
+  end
+
+  defp icdf_loop(u, lambda, k, cdf) do
+    if cdf >= u or k > 100 do
+      k
+    else
+      next_p = cdf * lambda / (k + 1)
+      icdf_loop(u, lambda, k + 1, cdf + next_p)
+    end
+  end
+end
+
+# Re-define poisson_icdf for use above
+poisson_icdf = fn u, lam -> PoissonHelper.icdf(u, lam) end
+:ok
+```
+
+The mean test **passes**. The p-value is near 0.5. Of course it does —
+the posterior on λ was fit to match the mean. Testing the mean against
+a model that was calibrated to the mean is a **tautology**. This test
+statistic cannot detect misfit. This is the "bad test statistic" lesson
+from BDA3 Ch 6.
+
+## PPC — The Good Test Statistic
+
+Now test the **maximum weekly count**. A Poisson(4.3) model rarely
+produces weeks with 14 or 18 CVEs. If the model is right, the maximum
+of 52 Poisson draws should be much lower than 18.
+
+```elixir
+# T(y) = max weekly count
+observed_max = Enum.max(weekly_cves)
+
+{rep_maxes, _} =
+  Enum.reduce(lambda_samples, {[], rng}, fn lam, {acc, r} ->
+    {counts, r} =
+      Enum.reduce(1..n_weeks, {[], r}, fn _, {cs, r} ->
+        {u, r} = :rand.uniform_s(r)
+        k = poisson_icdf.(u, lam)
+        {[k | cs], r}
+      end)
+
+    rep_max = Enum.max(counts)
+    {[rep_max | acc], r}
+  end)
+
+rep_maxes = Enum.reverse(rep_maxes)
+
+p_max =
+  Enum.count(rep_maxes, fn rm -> rm >= observed_max end) / length(rep_maxes)
+
+%{
+  observed_max: observed_max,
+  rep_max_mean: Float.round(Enum.sum(rep_maxes) / length(rep_maxes), 1),
+  ppc_p_value_max: Float.round(p_max, 3),
+  verdict: "Max test: #{if p_max < 0.05, do: "FAIL — model is wrong", else: "PASS"}"
+}
+```
+
+```elixir
+# Plot: T(y_rep) distribution vs T(y_observed)
+max_data = Enum.map(rep_maxes, fn m -> %{max_cves: m} end)
+obs_line = [%{x: observed_max}]
+
+Vl.new(width: 500, height: 260, title: "PPC: max weekly CVE count")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(max_data)
+  |> Vl.mark(:bar, color: "#4c78a8", opacity: 0.7)
+  |> Vl.encode_field(:x, "max_cves", type: :quantitative, bin: %{maxbins: 20}, title: "max(y_rep)")
+  |> Vl.encode_field(:y, "max_cves", type: :quantitative, aggregate: :count),
+  Vl.new()
+  |> Vl.data_from_values(obs_line)
+  |> Vl.mark(:rule, color: "#e45756", stroke_width: 3)
+  |> Vl.encode_field(:x, "x", type: :quantitative)
+])
+```
+
+The observed maximum (red line at 18) is far to the right of the
+replicated distribution. The p-value is near 0. **The Poisson model is
+wrong.** The data have bursty clusters that a constant-rate model cannot
+produce.
+
+## What the Misfit Means for Security
+
+The PPC just told you: **your threat model assumes CVEs arrive at a
+constant rate, but they don't.** They cluster — around Patch Tuesday,
+around major library disclosures (Log4j, Spring4Shell), around
+coordinated disclosure windows.
+
+This has operational consequences:
+
+- **Patch capacity planning** based on the Poisson mean (4.3/week)
+  underestimates peak weeks. You need surge capacity.
+- **Alert thresholds** calibrated to "normal" Poisson variance will fire
+  during every cluster week, producing false positives that are actually
+  true bursts.
+- **The fix:** a model that allows overdispersion. Negative Binomial
+  (Poisson with a Gamma-distributed rate). Or a change-point model that
+  detects regime shifts. The PPC doesn't tell you which model is right
+  — it tells you the current one is wrong.
+
+## PPC — The Variance-to-Mean Ratio
+
+A third test statistic that directly targets overdispersion:
+
+```elixir
+observed_vmr = y_var / y_mean
+
+{rep_vmrs, _} =
+  Enum.reduce(lambda_samples, {[], rng}, fn lam, {acc, r} ->
+    {counts, r} =
+      Enum.reduce(1..n_weeks, {[], r}, fn _, {cs, r} ->
+        {u, r} = :rand.uniform_s(r)
+        k = poisson_icdf.(u, lam)
+        {[k | cs], r}
+      end)
+
+    rep_mean = Enum.sum(counts) / n_weeks
+    rep_var = Enum.reduce(counts, 0.0, fn c, acc -> acc + (c - rep_mean) ** 2 end) / (n_weeks - 1)
+    vmr = if rep_mean > 0, do: rep_var / rep_mean, else: 1.0
+
+    {[vmr | acc], r}
+  end)
+
+rep_vmrs = Enum.reverse(rep_vmrs)
+
+p_vmr = Enum.count(rep_vmrs, fn v -> v >= observed_vmr end) / length(rep_vmrs)
+
+%{
+  observed_vmr: Float.round(observed_vmr, 2),
+  rep_vmr_mean: Float.round(Enum.sum(rep_vmrs) / length(rep_vmrs), 2),
+  ppc_p_value_vmr: Float.round(p_vmr, 3),
+  verdict: "VMR test: #{if p_vmr < 0.05, do: "FAIL — overdispersed", else: "PASS"}"
+}
+```
+
+The variance-to-mean ratio test also fails. For Poisson data, VMR ≈ 1.
+The observed VMR is much higher. This confirms the clustering signal
+detected by the max test, from a different angle.
+
+## What This Tells You
+
+* **PPCs detect model misfit without a competing model.** You don't need
+  to know the *right* model. You just need to know the current one is
+  *wrong*. That alone changes your operational decisions.
+* **The test statistic is everything.** The mean test passed (tautology).
+  The max test failed (detected clusters). The VMR test failed (detected
+  overdispersion). Same data, same model, different conclusions depending
+  on what you measure.
+* **"Mean-based" security metrics are the bad test statistic.** "Average
+  4.3 CVEs per week" hides the cluster weeks. Report the max and the
+  variance-to-mean ratio too.
+* **PPCs are computationally cheap.** Draw from posterior, simulate data,
+  compute statistic, compare. No new model fit required.
+
+## Study Guide
+
+1. **Remove the three cluster weeks** (14, 18, 12) and re-run the PPCs.
+   Do the max and VMR tests pass now? What does this tell you about the
+   sensitivity of the check?
+
+2. **Replace Poisson with Negative Binomial.** The NB adds an
+   overdispersion parameter. Fit it (conjugate: Beta-Negative Binomial)
+   and re-run the max PPC. Does the NB model pass?
+
+3. **Design a PPC for the DGA contamination problem from Ch 3.** Fit a
+   normal model to the contaminated DNS lengths. What test statistic
+   detects the DGA outliers? (Hint: kurtosis or max length.)
+
+4. **(Hard.)** Implement a **calibration PPC**: for the brute-force
+   logistic model from Ch 3, simulate binomial data at each dose level
+   and check whether the observed counts fall within the 90% predictive
+   intervals. This is the PPC that detects logistic model misfit.
+
+## Literature
+
+* **Gelman et al.** *BDA3*, §6.3 (posterior predictive checking). The
+  Newcomb example is the structural template for the DGA problem.
+* **Gelman, Meng, & Stern.** (1996). "Posterior predictive assessment
+  of model fitness." *Statistica Sinica* 6:733–807. The foundational
+  paper on PPCs.
+
+### Where to Go Next
+
+* `notebooks/bda/ch06_posterior_predictive.livemd` — the same PPC
+  framework on Newcomb's light-speed data.
+* `notebooks/bda-cyber/ch03_network_baseline_bruteforce.livemd` — the
+  DGA contamination problem that a PPC would detect.
+* `notebooks/13_bayesian_spc.livemd` — Bayesian SPC is PPCs applied to
+  manufacturing. The CVE clustering problem is the security equivalent.

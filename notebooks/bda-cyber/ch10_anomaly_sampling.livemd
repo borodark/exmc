@@ -1,0 +1,277 @@
+# BDA-Cyber Chapter 10 — Rejection and Importance Sampling for Anomaly Detection
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Before NUTS, before Gibbs, before anyone wrote a PPL, there were two
+algorithms: **rejection sampling** and **importance sampling**. They were
+the entire toolbox for computing expectations under intractable
+distributions. They are still the building blocks of particle filters —
+which is how real-time anomaly detection systems work under the hood.
+
+This chapter implements both from scratch in pure Elixir. The target is
+a mixture distribution representing network traffic: a large normal
+component (benign traffic) with two small contaminating components
+(C2 beacons and port scans). The lesson is **what these algorithms do
+under the hood** and **why they fail in high dimensions** — which is
+exactly what NUTS had to solve.
+
+## The Target — Network Traffic Mixture
+
+Model the distribution of connection durations (in seconds) on a
+monitored network segment:
+
+- **70% benign browsing:** Normal(μ=30, σ=10) — typical web sessions
+- **20% short connections:** Normal(μ=2, σ=1) — DNS, pings, health checks
+- **10% C2 beacons:** Normal(μ=60, σ=3) — suspiciously regular, longer connections
+
+This mixture has three modes. Naive samplers fail in interesting ways.
+
+```elixir
+defmodule TrafficTarget do
+  @doc "Log-density of the network traffic mixture"
+  def log_pdf(x) do
+    # Three components: benign (70%), short (20%), C2 (10%)
+    p1 = 0.70 * gaussian(x, 30.0, 10.0)
+    p2 = 0.20 * gaussian(x, 2.0, 1.0)
+    p3 = 0.10 * gaussian(x, 60.0, 3.0)
+    total = p1 + p2 + p3
+    if total > 0, do: :math.log(total), else: -1000.0
+  end
+
+  def pdf(x) do
+    0.70 * gaussian(x, 30.0, 10.0) +
+    0.20 * gaussian(x, 2.0, 1.0) +
+    0.10 * gaussian(x, 60.0, 3.0)
+  end
+
+  defp gaussian(x, mu, sigma) do
+    z = (x - mu) / sigma
+    1.0 / (sigma * :math.sqrt(2 * :math.pi())) * :math.exp(-0.5 * z * z)
+  end
+end
+
+# Visualize the target
+target_data =
+  Nx.linspace(-10, 80, n: 500)
+  |> Nx.to_list()
+  |> Enum.map(fn x -> %{x: x, density: TrafficTarget.pdf(x)} end)
+
+Vl.new(width: 600, height: 240, title: "Target: network traffic duration mixture")
+|> Vl.data_from_values(target_data)
+|> Vl.mark(:area, color: "#4c78a8", opacity: 0.5)
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "Connection duration (seconds)")
+|> Vl.encode_field(:y, "density", type: :quantitative, title: "p(x)")
+```
+
+## Rejection Sampling
+
+**Idea:** draw from a simple proposal distribution g(x) that covers the
+target f(x). Accept the draw with probability f(x) / (M × g(x)), where
+M is a bound on f(x)/g(x).
+
+Use a wide Uniform(−10, 80) proposal:
+
+```elixir
+# Proposal: Uniform(-10, 80)
+a_prop = -10.0
+b_prop = 80.0
+g_density = 1.0 / (b_prop - a_prop)
+
+# Find M: max of f(x) / g(x) over the support
+m_bound =
+  Nx.linspace(a_prop, b_prop, n: 1000)
+  |> Nx.to_list()
+  |> Enum.map(fn x -> TrafficTarget.pdf(x) / g_density end)
+  |> Enum.max()
+
+# Add safety margin
+m_bound = m_bound * 1.05
+
+n_target = 5_000
+rng = :rand.seed_s(:exsss, 42)
+
+{accepted, total_proposed, _} =
+  Stream.iterate({[], 0, rng}, fn {acc, n, r} ->
+    {u1, r} = :rand.uniform_s(r)
+    x = a_prop + u1 * (b_prop - a_prop)
+
+    {u2, r} = :rand.uniform_s(r)
+    accept_prob = TrafficTarget.pdf(x) / (m_bound * g_density)
+
+    if u2 < accept_prob do
+      {[x | acc], n + 1, r}
+    else
+      {acc, n + 1, r}
+    end
+  end)
+  |> Enum.find(fn {acc, _, _} -> length(acc) >= n_target end)
+
+acceptance_rate = n_target / total_proposed
+
+%{
+  accepted: length(accepted),
+  proposed: total_proposed,
+  acceptance_rate: "#{Float.round(acceptance_rate * 100, 1)}%",
+  M_bound: Float.round(m_bound, 2)
+}
+```
+
+```elixir
+sample_data = Enum.map(accepted, fn x -> %{x: x} end)
+
+Vl.new(width: 600, height: 240, title: "Rejection sampling — #{length(accepted)} accepted samples")
+|> Vl.data_from_values(sample_data)
+|> Vl.mark(:bar, color: "#54a24b", opacity: 0.7)
+|> Vl.encode_field(:x, "x", type: :quantitative, bin: %{maxbins: 50}, title: "Connection duration (seconds)")
+|> Vl.encode_field(:y, "x", type: :quantitative, aggregate: :count)
+```
+
+The histogram matches the target. But the acceptance rate is low — maybe
+3–5%. Most proposals are wasted. In 2D this gets worse. In 10D, the
+acceptance rate approaches zero. This is why rejection sampling dies in
+high dimensions.
+
+## Importance Sampling
+
+**Idea:** don't reject samples. Keep all of them, but reweight each
+sample by w(x) = f(x) / g(x). The weighted average converges to the
+expectation under f.
+
+Use Normal(30, 15) as the proposal — centered on the main mode:
+
+```elixir
+defmodule ISHelper do
+  def gaussian(x, mu, sigma) do
+    z = (x - mu) / sigma
+    1.0 / (sigma * :math.sqrt(2 * :math.pi())) * :math.exp(-0.5 * z * z)
+  end
+end
+
+# Proposal: Normal(30, 15)
+g_mu = 30.0
+g_sigma = 15.0
+
+n_is = 10_000
+rng = :rand.seed_s(:exsss, 42)
+
+{is_samples, _} =
+  Enum.reduce(1..n_is, {[], rng}, fn _, {acc, r} ->
+    {z, r} = :rand.normal_s(r)
+    x = g_mu + g_sigma * z
+    f_x = TrafficTarget.pdf(x)
+    g_x = ISHelper.gaussian(x, g_mu, g_sigma)
+    w = if g_x > 1.0e-15, do: f_x / g_x, else: 0.0
+    {[%{x: x, weight: w} | acc], r}
+  end)
+
+is_samples = Enum.reverse(is_samples)
+
+# Effective sample size
+weights = Enum.map(is_samples, & &1.weight)
+w_sum = Enum.sum(weights)
+w_sq_sum = Enum.reduce(weights, 0.0, fn w, acc -> acc + w * w end)
+ess = w_sum * w_sum / w_sq_sum
+
+# Weighted mean of x
+weighted_mean =
+  Enum.reduce(is_samples, 0.0, fn %{x: x, weight: w}, acc -> acc + x * w end) / w_sum
+
+%{
+  n_samples: n_is,
+  ess: Float.round(ess, 0),
+  ess_fraction: "#{Float.round(ess / n_is * 100, 1)}%",
+  weighted_mean: Float.round(weighted_mean, 1),
+  problem: "Proposal misses the C2 mode at x=60 and the short-connection mode at x=2"
+}
+```
+
+The ESS is much lower than n — most weight concentrates on a few samples
+where f(x) >> g(x). The Normal(30, 15) proposal undercovers the C2
+beacon mode at x = 60 and the short-connection mode at x = 2.
+
+**The security lesson:** if your anomaly detection proposal distribution
+doesn't cover the tails where attacks live, importance sampling gives
+you terrible ESS on exactly the samples that matter most. A proposal
+tuned to "normal traffic" will miss the C2 beacons.
+
+## Why These Methods Fail in High Dimensions
+
+In 1D, rejection sampling needs ~20–50 proposals per acceptance. In d
+dimensions, it needs M^d. For a 10-dimensional network flow feature
+vector (bytes, duration, packets, IAT, ...), even M = 2 gives 2^10 =
+1024 proposals per acceptance. At M = 5 and d = 20, you need 5^20 ≈ 10^14.
+
+Importance sampling degrades differently: the weight variance explodes
+exponentially, so ESS → 0 even with millions of samples.
+
+This is the motivation for MCMC (Ch 11) and NUTS (Ch 5). They explore
+the posterior by *walking through it* — no proposals wasted in empty
+space, no weights that explode. The cost per sample is higher, but the
+cost per *effective* sample is dramatically lower.
+
+## What This Tells You
+
+* **Rejection sampling is exact but wasteful.** Every accepted sample
+  is an exact draw from the target. But the acceptance rate plummets in
+  high dimensions.
+* **Importance sampling uses everything but unevenly.** All samples
+  count, but the weights can concentrate on a few points, destroying
+  ESS. The proposal must cover the target's tails.
+* **Both methods break at ~d > 5.** Beyond 5 dimensions, you need MCMC.
+  This is a fact of geometry, not a limitation of the implementation.
+* **Particle filters are sequential importance sampling** with
+  resampling. If you understand IS, you understand the engine inside
+  every real-time anomaly detection system.
+
+## Study Guide
+
+1. **Use a mixture proposal** for importance sampling: 70% Normal(30,15)
+   + 20% Normal(2,3) + 10% Normal(60,5). How much does ESS improve?
+
+2. **Compute P(x > 50)** — the probability of a long connection — via
+   both rejection and importance sampling. How many samples do you need
+   for each method to estimate this rare-event probability to within 1%?
+
+3. **Add a 4th component** to the target: 2% Uniform(70, 80) (data
+   exfiltration — very long connections). Does rejection sampling still
+   work? What happens to the IS weights?
+
+4. **(Hard.)** Extend to 2D: model (duration, bytes_sent) as a bivariate
+   mixture. Implement rejection sampling in 2D. How does the acceptance
+   rate change compared to 1D?
+
+## Literature
+
+* **Gelman et al.** *BDA3*, §10.1–10.3 (rejection and importance
+  sampling). The 1D examples that this notebook parallels.
+* **Doucet, A., de Freitas, N., & Gordon, N.** (2001). *Sequential Monte
+  Carlo Methods in Practice*. The bridge from IS to particle filters.
+
+### Where to Go Next
+
+* `notebooks/bda/ch10_rejection_importance.livemd` — the same algorithms
+  on a toy distribution.
+* `notebooks/bda-cyber/ch11_mcmc_traffic.livemd` — Gibbs and Metropolis,
+  which survive where rejection and IS fail.

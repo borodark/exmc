@@ -1,0 +1,366 @@
+# BDA-Cyber Chapter 11 — Gibbs and Metropolis on Network Traffic
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Chapter 10 gave you rejection and importance sampling — and showed why
+they die in high dimensions. The fix: **Markov Chain Monte Carlo**. Build
+a Markov chain whose stationary distribution is the target posterior,
+then walk it. After enough steps, the chain visits each region in
+proportion to its density.
+
+Two foundational MCMC algorithms:
+
+- **Gibbs sampling:** sample each variable from its full conditional,
+  holding everything else fixed. Requires knowing the conditionals.
+- **Metropolis sampling:** propose a move, accept or reject based on the
+  density ratio. Requires only evaluating the log density.
+
+Every modern sampler — NUTS, HMC, slice sampling — descends from one of
+these. Implementing both from scratch tells you exactly what NUTS had to
+invent and why.
+
+The target: a bivariate distribution representing correlated network
+features — connection duration and bytes transferred. These are
+correlated in real traffic (longer connections transfer more bytes),
+and that correlation is precisely what makes naive samplers struggle.
+
+## The Target — Correlated Network Features
+
+A bivariate normal with correlation ρ = 0.85:
+
+$$
+\begin{pmatrix} \text{duration} \\ \text{bytes} \end{pmatrix}
+\sim \mathrm{Normal}\!\left(
+\begin{pmatrix} 30 \\ 5000 \end{pmatrix},\;
+\begin{pmatrix} 100 & 850 \\ 850 & 10000 \end{pmatrix}
+\right)
+$$
+
+In seconds and bytes. Duration σ = 10, bytes σ = 100, correlation 0.85.
+
+```elixir
+# Target parameters (standardized for sampling, then rescale)
+mu1 = 0.0    # standardized duration
+mu2 = 0.0    # standardized bytes
+rho = 0.85
+sigma1 = 1.0
+sigma2 = 1.0
+
+defmodule TrafficMCMC do
+  def log_pdf(t1, t2, mu1, mu2, s1, s2, rho) do
+    z1 = (t1 - mu1) / s1
+    z2 = (t2 - mu2) / s2
+    quad = (z1 * z1 - 2 * rho * z1 * z2 + z2 * z2) / (1 - rho * rho)
+    -0.5 * quad - :math.log(2 * :math.pi() * s1 * s2 * :math.sqrt(1 - rho * rho))
+  end
+end
+
+:ok
+```
+
+## Gibbs Sampling
+
+For a bivariate normal, the full conditionals are known:
+
+$$
+\theta_1 \mid \theta_2 \sim \text{Normal}\!\left(\mu_1 + \rho \frac{\sigma_1}{\sigma_2}(\theta_2 - \mu_2),\;
+\sigma_1^2(1 - \rho^2)\right)
+$$
+
+and symmetrically for θ₂ | θ₁. Gibbs alternates between these.
+
+```elixir
+n_gibbs = 5_000
+rng = :rand.seed_s(:exsss, 42)
+
+# Conditional standard deviation
+cond_sd = :math.sqrt(1 - rho * rho)
+
+{gibbs_chain, _} =
+  Enum.reduce(1..n_gibbs, {[{0.0, 0.0}], rng}, fn _, {[{t1, t2} | _] = chain, r} ->
+    # Sample t1 | t2
+    cond_mean_1 = mu1 + rho * (sigma1 / sigma2) * (t2 - mu2)
+    {z, r} = :rand.normal_s(r)
+    new_t1 = cond_mean_1 + cond_sd * z
+
+    # Sample t2 | t1 (using updated t1)
+    cond_mean_2 = mu2 + rho * (sigma2 / sigma1) * (new_t1 - mu1)
+    {z, r} = :rand.normal_s(r)
+    new_t2 = cond_mean_2 + cond_sd * z
+
+    {[{new_t1, new_t2} | chain], r}
+  end)
+
+gibbs_chain = Enum.reverse(gibbs_chain)
+
+# Summary statistics
+t1_samples = Enum.map(gibbs_chain, &elem(&1, 0))
+t2_samples = Enum.map(gibbs_chain, &elem(&1, 1))
+
+gibbs_mean_1 = Enum.sum(t1_samples) / length(t1_samples)
+gibbs_mean_2 = Enum.sum(t2_samples) / length(t2_samples)
+
+# Empirical correlation
+cov_12 =
+  Enum.zip(t1_samples, t2_samples)
+  |> Enum.reduce(0.0, fn {a, b}, acc -> acc + (a - gibbs_mean_1) * (b - gibbs_mean_2) end)
+  |> then(fn s -> s / length(t1_samples) end)
+
+var_1 = Enum.reduce(t1_samples, 0.0, fn a, acc -> acc + (a - gibbs_mean_1) ** 2 end) / length(t1_samples)
+var_2 = Enum.reduce(t2_samples, 0.0, fn a, acc -> acc + (a - gibbs_mean_2) ** 2 end) / length(t2_samples)
+emp_corr = cov_12 / (:math.sqrt(var_1) * :math.sqrt(var_2))
+
+%{
+  n_samples: length(gibbs_chain),
+  mean_duration: Float.round(gibbs_mean_1, 3),
+  mean_bytes: Float.round(gibbs_mean_2, 3),
+  empirical_correlation: Float.round(emp_corr, 3),
+  target_correlation: rho
+}
+```
+
+```elixir
+gibbs_data =
+  gibbs_chain
+  |> Enum.take(2000)
+  |> Enum.map(fn {t1, t2} -> %{duration: t1, bytes: t2} end)
+
+Vl.new(width: 400, height: 400, title: "Gibbs samples — correlated network features")
+|> Vl.data_from_values(gibbs_data)
+|> Vl.mark(:circle, size: 4, opacity: 0.3, color: "#4c78a8")
+|> Vl.encode_field(:x, "duration", type: :quantitative, title: "Duration (standardized)")
+|> Vl.encode_field(:y, "bytes", type: :quantitative, title: "Bytes (standardized)")
+```
+
+The scatter plot shows the tilted ellipse of the bivariate normal. Gibbs
+recovers it correctly — the empirical correlation matches the target ρ.
+
+But notice: Gibbs moves along **axis-aligned conditionals**. At high
+correlation (ρ = 0.85), each step moves mostly along one axis, making
+slow diagonal progress. The effective sample size per iteration is
+low. This is the seed of the problem that HMC solves.
+
+## Gibbs Trace Plot
+
+```elixir
+trace_data =
+  gibbs_chain
+  |> Enum.with_index()
+  |> Enum.flat_map(fn {{t1, t2}, i} ->
+    [
+      %{iteration: i, value: t1, variable: "Duration"},
+      %{iteration: i, value: t2, variable: "Bytes"}
+    ]
+  end)
+  |> Enum.take(4000)
+
+Vl.new(width: 600, height: 300, title: "Gibbs trace plots")
+|> Vl.data_from_values(trace_data)
+|> Vl.mark(:line, stroke_width: 0.5, opacity: 0.5)
+|> Vl.encode_field(:x, "iteration", type: :quantitative)
+|> Vl.encode_field(:y, "value", type: :quantitative)
+|> Vl.encode_field(:row, "variable", type: :nominal)
+|> Vl.encode_field(:color, "variable", type: :nominal)
+```
+
+## Metropolis Sampling
+
+Metropolis doesn't need full conditionals — just the ability to evaluate
+the log density at any point. Propose a random step, accept if it moves
+"uphill" (or randomly accept downhill with probability proportional to
+the density ratio).
+
+```elixir
+n_metro = 10_000
+proposal_sd = 0.5  # step size
+rng = :rand.seed_s(:exsss, 42)
+
+{metro_chain, n_accepted, _} =
+  Enum.reduce(1..n_metro, {[{0.0, 0.0}], 0, rng}, fn _, {[{t1, t2} | _] = chain, n_acc, r} ->
+    # Propose: symmetric random walk
+    {z1, r} = :rand.normal_s(r)
+    {z2, r} = :rand.normal_s(r)
+    prop_t1 = t1 + proposal_sd * z1
+    prop_t2 = t2 + proposal_sd * z2
+
+    # Log acceptance ratio
+    log_current = TrafficMCMC.log_pdf(t1, t2, mu1, mu2, sigma1, sigma2, rho)
+    log_proposed = TrafficMCMC.log_pdf(prop_t1, prop_t2, mu1, mu2, sigma1, sigma2, rho)
+    log_alpha = log_proposed - log_current
+
+    {u, r} = :rand.uniform_s(r)
+
+    if :math.log(u) < log_alpha do
+      {[{prop_t1, prop_t2} | chain], n_acc + 1, r}
+    else
+      {[{t1, t2} | chain], n_acc, r}
+    end
+  end)
+
+metro_chain = Enum.reverse(metro_chain)
+accept_rate = n_accepted / n_metro
+
+%{
+  n_samples: length(metro_chain),
+  acceptance_rate: "#{Float.round(accept_rate * 100, 1)}%",
+  optimal_acceptance: "~23% for 2D (Roberts et al. 1997)",
+  proposal_sd: proposal_sd
+}
+```
+
+```elixir
+metro_data =
+  metro_chain
+  |> Enum.take(2000)
+  |> Enum.map(fn {t1, t2} -> %{duration: t1, bytes: t2} end)
+
+Vl.new(width: 400, height: 400, title: "Metropolis samples — proposal_sd=#{proposal_sd}")
+|> Vl.data_from_values(metro_data)
+|> Vl.mark(:circle, size: 4, opacity: 0.3, color: "#e45756")
+|> Vl.encode_field(:x, "duration", type: :quantitative, title: "Duration (standardized)")
+|> Vl.encode_field(:y, "bytes", type: :quantitative, title: "Bytes (standardized)")
+```
+
+## Tuning the Proposal — Too Small, Too Large, Just Right
+
+```elixir
+proposal_sds = [0.1, 0.5, 1.5, 5.0]
+
+tuning_results =
+  for psd <- proposal_sds do
+    rng = :rand.seed_s(:exsss, 42)
+
+    {chain, n_acc, _} =
+      Enum.reduce(1..5000, {[{0.0, 0.0}], 0, rng}, fn _, {[{t1, t2} | _] = c, na, r} ->
+        {z1, r} = :rand.normal_s(r)
+        {z2, r} = :rand.normal_s(r)
+        pt1 = t1 + psd * z1
+        pt2 = t2 + psd * z2
+
+        lc = TrafficMCMC.log_pdf(t1, t2, mu1, mu2, sigma1, sigma2, rho)
+        lp = TrafficMCMC.log_pdf(pt1, pt2, mu1, mu2, sigma1, sigma2, rho)
+        {u, r} = :rand.uniform_s(r)
+
+        if :math.log(u) < (lp - lc) do
+          {[{pt1, pt2} | c], na + 1, r}
+        else
+          {[{t1, t2} | c], na, r}
+        end
+      end)
+
+    t1s = Enum.map(chain, &elem(&1, 0))
+    # Crude ESS estimate: n / (1 + 2*sum of autocorrelations)
+    # Approximate via lag-1 autocorrelation
+    mean1 = Enum.sum(t1s) / length(t1s)
+    var1 = Enum.reduce(t1s, 0.0, fn x, acc -> acc + (x - mean1) ** 2 end) / length(t1s)
+
+    lag1 =
+      t1s
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.reduce(0.0, fn [a, b], acc -> acc + (a - mean1) * (b - mean1) end)
+      |> then(fn s -> s / (length(t1s) * var1) end)
+
+    ess_approx = length(t1s) / (1 + 2 * max(lag1, 0))
+
+    %{
+      proposal_sd: psd,
+      acceptance: "#{Float.round(n_acc / 5000 * 100, 1)}%",
+      ess_approx: round(ess_approx)
+    }
+  end
+
+tuning_results
+```
+
+| proposal_sd | acceptance | ESS | Problem |
+|---|---|---|---|
+| 0.1 | ~95% | low | Accepts everything, moves nowhere |
+| 0.5 | ~60% | moderate | OK but slow exploration |
+| 1.5 | ~25% | highest | Near optimal for 2D |
+| 5.0 | ~5% | low | Overshoots, rejects almost everything |
+
+The optimal acceptance rate for Metropolis on a d-dimensional target is
+~23.4% (Roberts et al. 1997). The proposal_sd that achieves this
+produces the highest ESS — the best trade-off between exploration
+(large steps) and acceptance (not overshooting).
+
+**This is what NUTS automates.** It finds the step size that gives ~65%
+acceptance (the HMC optimal), and it uses gradient information to
+propose moves that follow the posterior's curvature instead of
+stumbling randomly. Every NUTS run you've done in Ch 5 was a descendant
+of this Metropolis loop — with the step size tuned automatically and the
+random walk replaced by Hamiltonian dynamics.
+
+## What This Tells You
+
+* **Gibbs is elegant when you have conditionals.** For conjugate models,
+  each step is an exact draw. But axis-aligned moves struggle with
+  correlation — and correlation is the norm in real data.
+* **Metropolis is universal.** It only needs log density evaluations. No
+  conjugacy, no conditionals. But tuning the proposal is critical, and
+  optimal tuning depends on the geometry of the target.
+* **High correlation kills both.** At ρ = 0.85, both Gibbs and
+  Metropolis take many steps to cross the posterior diagonally. NUTS
+  uses the gradient to follow the contour directly.
+* **NUTS is Metropolis with a physics engine.** Instead of random
+  proposals, HMC simulates a particle sliding on the log-density surface.
+  NUTS adds adaptive step size and a "no U-turn" stopping rule. The
+  result: near-independent samples from complex posteriors. Every
+  `Sampler.sample/3` call in other notebooks runs this machinery.
+
+## Study Guide
+
+1. **Increase ρ to 0.95.** How does the Gibbs ESS change? How does
+   Metropolis ESS change at each proposal_sd? At what ρ does Gibbs
+   become practically useless?
+
+2. **Replace the bivariate normal with a banana-shaped distribution:**
+   `θ₂ = θ₁² + ε`. Implement Metropolis on this target. Does the
+   acceptance rate change? What about ESS?
+
+3. **Add the C2 beacon mode from Ch 10** (a second Gaussian at (3, 3)).
+   Run Metropolis. Does the chain visit both modes? How many iterations
+   does it take to jump between them?
+
+4. **(Hard.)** Implement a simple **Hamiltonian Monte Carlo** sampler
+   (leapfrog integrator + accept/reject) for the bivariate normal.
+   Compare its ESS to Metropolis at the same number of evaluations.
+   This is the step between Metropolis and NUTS.
+
+## Literature
+
+* **Gelman et al.** *BDA3*, §11.1–11.4 (Gibbs and Metropolis).
+* **Roberts, G.O., Gelman, A., & Gilks, W.R.** (1997). "Weak
+  convergence and optimal scaling of random walk Metropolis algorithms."
+  *Annals of Applied Probability*. The 23.4% result.
+* **Neal, R.** (2011). "MCMC using Hamiltonian dynamics." *Handbook of
+  MCMC*. The bridge from Metropolis to HMC.
+
+### Where to Go Next
+
+* `notebooks/bda/ch11_gibbs_metropolis.livemd` — the same algorithms on
+  a toy bivariate normal.
+* `notebooks/bda-cyber/ch05_eight_socs.livemd` — NUTS solving the
+  problem that Gibbs and Metropolis cannot: the hierarchical funnel.

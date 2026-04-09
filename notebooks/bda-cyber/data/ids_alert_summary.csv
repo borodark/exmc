@@ -1,0 +1,11 @@
+rule_id,description,alerts_fired,investigated,true_positives,false_positives,period
+SID-2024-1001,HTTP exploit attempt,847,200,43,157,2025-Q3
+SID-2024-1042,SSH brute force,312,150,71,79,2025-Q3
+SID-2024-1087,DNS tunnel heuristic,2241,180,6,174,2025-Q3
+SID-2024-1103,Lateral movement SMB,156,100,52,48,2025-Q3
+SID-2024-1229,TLS cert anomaly,1893,120,9,111,2025-Q3
+SID-2024-1301,Outbound C2 beacon,423,200,87,113,2025-Q3
+SID-2024-1355,Port scan detection,3102,160,12,148,2025-Q3
+SID-2024-1410,Credential stuffing,567,180,63,117,2025-Q3
+SID-2024-1488,Data exfil volume,234,120,41,79,2025-Q3
+SID-2024-1512,Privilege escalation,189,100,38,62,2025-Q3

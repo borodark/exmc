@@ -1,0 +1,476 @@
+# BDA-Cyber Chapter 2 — How Good Is Your IDS Rule?
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Your network IDS fires an alert. The rule's documentation says **95% detection
+rate**. Your gut says: high confidence, probably real. Your gut is wrong.
+
+Here is the calculation that every SOC analyst lives with but almost none
+can articulate:
+
+> Your IDS rule has a 95% true positive rate (catches 95% of real attacks)
+> and a 5% false positive rate (fires on 5% of benign traffic). Real attacks
+> are 0.1% of all traffic. An alert fires. What is the probability that this
+> alert is a real attack?
+
+The naive answer is 95%. The correct answer is **1.9%**. The gap between
+those two numbers is the formal explanation for alert fatigue — the defining
+operational problem of every security operations center on earth.
+
+This notebook teaches you how to compute the correct answer, how to update it
+as evidence accumulates, and how prior beliefs about rule quality change
+the posterior. The math is the same Beta-Binomial model used in BDA3 Ch 2.
+The stakes are different.
+
+## The Base Rate Problem
+
+Bayes' theorem, applied to a single alert:
+
+$$
+P(\text{attack} \mid \text{alert}) = \frac{P(\text{alert} \mid \text{attack})\; P(\text{attack})}{P(\text{alert})}
+$$
+
+where
+
+$$
+P(\text{alert}) = P(\text{alert} \mid \text{attack})\; P(\text{attack}) + P(\text{alert} \mid \text{benign})\; P(\text{benign}).
+$$
+
+```elixir
+# The numbers
+tpr = 0.95        # P(alert | attack) — true positive rate
+fpr = 0.05        # P(alert | benign) — false positive rate
+base_rate = 0.001 # P(attack) — real attacks are 0.1% of traffic
+
+p_alert = tpr * base_rate + fpr * (1 - base_rate)
+p_attack_given_alert = tpr * base_rate / p_alert
+
+%{
+  naive_answer: "95%",
+  correct_answer: "#{Float.round(p_attack_given_alert * 100, 1)}%",
+  p_alert: Float.round(p_alert, 5),
+  explanation: "1 true alert per #{round(1 / (tpr * base_rate))} alerts fired"
+}
+```
+
+A "95%-accurate" rule produces alerts that are real only **1.9% of the time**.
+This is not a flaw in the rule. It is a consequence of the base rate: real
+attacks are rare, so even a small false positive rate generates far more noise
+than the true positive rate generates signal.
+
+## The Fix: Stacking Evidence
+
+What if you require **two independent rules** to both fire before
+escalating? Suppose Rule B has a 90% TPR and 10% FPR, independent of Rule A.
+
+```elixir
+# Two independent rules, both must fire
+tpr_a = 0.95
+fpr_a = 0.05
+tpr_b = 0.90
+fpr_b = 0.10
+
+# Joint probabilities (independence)
+joint_tpr = tpr_a * tpr_b      # P(both fire | attack)
+joint_fpr = fpr_a * fpr_b      # P(both fire | benign)
+
+p_alert_joint = joint_tpr * base_rate + joint_fpr * (1 - base_rate)
+p_attack_joint = joint_tpr * base_rate / p_alert_joint
+
+%{
+  single_rule: "#{Float.round(p_attack_given_alert * 100, 1)}%",
+  two_rules: "#{Float.round(p_attack_joint * 100, 1)}%",
+  improvement: "#{Float.round(p_attack_joint / p_attack_given_alert, 1)}x"
+}
+```
+
+Two independent rules, both required to fire: posterior jumps from **1.9%
+to ~14.6%**. This is Bayesian updating in action — each piece of independent
+evidence multiplies the odds. Three rules? Four? The posterior rises fast.
+This is how evidence *should* be combined in a SOC, and it is not how
+most SIEM correlation engines work.
+
+## The Posterior — Estimating the True Positive Rate
+
+Now the Beta-Binomial. Suppose you are a SOC analyst who has been tracking
+Rule SID-2024-1001. Over the past quarter, the rule fired **847 times**.
+Your team investigated a sample of 200 alerts and confirmed **43 were true
+positives** (verified incidents) and **157 were false positives**.
+
+The question: **what is the true positive rate of this rule?**
+
+The sample proportion is `43 / 200 = 0.215`. But sample proportions wobble.
+With 200 investigations, how much wobble is plausible? The Bayesian answer
+is the posterior distribution over the unknown true TP rate `θ`.
+
+Place a uniform prior on `θ`:
+
+$$
+p(\theta) = \mathrm{Beta}(\theta \mid 1, 1) = 1 \quad \text{for } \theta \in [0, 1].
+$$
+
+The likelihood for `k = 43` true positives in `n = 200` investigations is
+binomial. The conjugate posterior is:
+
+$$
+p(\theta \mid k, n) = \mathrm{Beta}(\theta \mid k+1,\; n-k+1) = \mathrm{Beta}(44, 158).
+$$
+
+```elixir
+# Data — SOC investigation results for Rule SID-2024-1001
+k = 43           # confirmed true positives
+n = 200          # total investigated alerts
+n_fp = n - k     # false positives
+
+%{true_positives: k, false_positives: n_fp, total: n, sample_tp_rate: k / n}
+```
+
+```elixir
+alias Exmc.Dist.Beta
+alias Exmc.Math
+
+# Posterior Beta(α, β) parameters
+alpha = k + 1
+beta_param = n - k + 1
+
+# Evaluate density on a grid
+grid = Nx.linspace(0.10, 0.35, n: 400) |> Nx.to_list()
+
+posterior_pdf =
+  for theta <- grid do
+    log_p =
+      Beta.logpdf(
+        Nx.tensor(theta),
+        %{alpha: Nx.tensor(alpha * 1.0), beta: Nx.tensor(beta_param * 1.0)}
+      )
+      |> Nx.to_number()
+
+    %{theta: theta, density: :math.exp(log_p)}
+  end
+
+%{alpha: alpha, beta: beta_param, posterior_mean: Float.round(alpha / (alpha + beta_param), 4)}
+```
+
+```elixir
+# Posterior mean, mode, and 95% central interval
+post_mean = alpha / (alpha + beta_param)
+post_mode = (alpha - 1) / (alpha + beta_param - 2)
+post_var = alpha * beta_param / ((alpha + beta_param) ** 2 * (alpha + beta_param + 1))
+post_sd = :math.sqrt(post_var)
+
+ci_lo = post_mean - 1.96 * post_sd
+ci_hi = post_mean + 1.96 * post_sd
+
+%{
+  posterior_mean: Float.round(post_mean, 4),
+  posterior_mode: Float.round(post_mode, 4),
+  posterior_sd: Float.round(post_sd, 4),
+  ci_95: {Float.round(ci_lo, 4), Float.round(ci_hi, 4)},
+  vendor_claim: 0.95
+}
+```
+
+The posterior is centered at **0.218** with a 95% interval of roughly
+**(0.161, 0.274)**. The vendor's claimed 95% detection rate is nowhere near
+this interval. The rule detects about 1 in 5 real attacks, not 19 in 20.
+
+This is not unusual. Vendor detection rates are measured on curated malware
+samples in lab conditions. Your network has different traffic patterns,
+different evasion techniques, different attack distributions. The posterior
+is what the rule does *in your environment*.
+
+## Plotting the Posterior
+
+```elixir
+vendor_data = [%{x: 0.95, label: "vendor claim (0.95)"}]
+
+Vl.new(width: 600, height: 280, title: "Posterior p(θ | k=43, n=200) — Rule SID-2024-1001")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(posterior_pdf)
+  |> Vl.mark(:area, color: "#4c78a8", opacity: 0.5)
+  |> Vl.encode_field(:x, "theta",
+    type: :quantitative,
+    title: "θ (true positive rate)",
+    scale: %{domain: [0.05, 0.40]}
+  )
+  |> Vl.encode_field(:y, "density", type: :quantitative, title: "p(θ|k,n)")
+])
+```
+
+The entire posterior mass sits below 0.30. The vendor claim of 0.95 would
+be off the right edge of the plot. The data are unambiguous: this rule, in
+this environment, has a TP rate between 16% and 27%.
+
+## Prior Sensitivity — What If You Trust the Vendor?
+
+A reasonable critique: "you used a flat prior, but I have prior information."
+The vendor says 95%. Your experienced colleague says "maybe 30%." Let's
+compare four priors of varying strength:
+
+| Prior                  | α₀ | β₀ | Effective sample size | What it encodes                     |
+| ---------------------- | ----- | ----- | --------------------- | ----------------------------------- |
+| Uniform                | 1     | 1     | 2                     | "No idea"                           |
+| Skeptical (~20)        | 4     | 16    | 20                    | "~20% TP rate, weakly held"         |
+| Moderate (~100)        | 30    | 70    | 100                   | "~30%, backed by ~100 past reviews" |
+| Vendor faithful (~500) | 475   | 25    | 500                   | "95% TP rate, strong belief"        |
+
+```elixir
+priors = [
+  %{label: "Uniform Beta(1,1)", a0: 1.0, b0: 1.0},
+  %{label: "Skeptical Beta(4,16)", a0: 4.0, b0: 16.0},
+  %{label: "Moderate Beta(30,70)", a0: 30.0, b0: 70.0},
+  %{label: "Vendor Beta(475,25)", a0: 475.0, b0: 25.0}
+]
+
+prior_sensitivity_data =
+  for %{label: label, a0: a0, b0: b0} <- priors,
+      theta <- grid do
+    a = a0 + k
+    b = b0 + n - k
+
+    log_p =
+      Beta.logpdf(Nx.tensor(theta), %{alpha: Nx.tensor(a), beta: Nx.tensor(b)})
+      |> Nx.to_number()
+
+    %{theta: theta, density: :math.exp(log_p), prior: label}
+  end
+
+Vl.new(width: 600, height: 320, title: "Posterior vs prior strength — IDS Rule TP Rate")
+|> Vl.data_from_values(prior_sensitivity_data)
+|> Vl.mark(:line, stroke_width: 2)
+|> Vl.encode_field(:x, "theta", type: :quantitative, title: "θ (true positive rate)")
+|> Vl.encode_field(:y, "density", type: :quantitative, title: "p(θ|k,n)")
+|> Vl.encode_field(:color, "prior", type: :nominal)
+```
+
+Three of the four priors agree closely — 200 investigations overwhelm any
+prior weaker than ~100 pseudo-observations. Only the **Vendor faithful**
+prior (claiming 500 investigations worth of 95% performance) pulls the
+posterior significantly rightward. And even then, 200 real investigations
+that show 21.5% TP rate are hard to ignore.
+
+This is the meaningful version of "vendor benchmarks vs. field performance."
+The prior matters in proportion to its claimed information. A vendor who
+says "95% detection rate, tested on 50 samples" is making a weak claim
+that your data will overpower. A vendor who says "95%, tested on 50,000
+samples in your industry vertical" is making a strong claim — and one you
+should ask to see the evidence for.
+
+## Comparing Multiple Rules
+
+You don't run one rule. You run hundreds. Here are five rules from the
+same quarter:
+
+```elixir
+rules = [
+  %{rule: "SID-2024-1001", alerts: 847, investigated: 200, true_pos: 43},
+  %{rule: "SID-2024-1042", alerts: 312, investigated: 150, true_pos: 71},
+  %{rule: "SID-2024-1087", alerts: 2241, investigated: 180, true_pos: 6},
+  %{rule: "SID-2024-1103", alerts: 156, investigated: 100, true_pos: 52},
+  %{rule: "SID-2024-1229", alerts: 1893, investigated: 120, true_pos: 9}
+]
+
+rule_posteriors =
+  for %{rule: rule, investigated: ni, true_pos: ki} <- rules do
+    ai = ki + 1
+    bi = ni - ki + 1
+    mean = ai / (ai + bi)
+    sd = :math.sqrt(ai * bi / ((ai + bi) ** 2 * (ai + bi + 1)))
+
+    %{
+      rule: rule,
+      tp_rate: Float.round(ki / ni, 3),
+      posterior_mean: Float.round(mean, 3),
+      ci_lo: Float.round(mean - 1.96 * sd, 3),
+      ci_hi: Float.round(mean + 1.96 * sd, 3)
+    }
+  end
+```
+
+```elixir
+# Posterior densities for all five rules
+multi_rule_data =
+  for %{rule: rule, investigated: ni, true_pos: ki} <- rules,
+      theta <- Nx.linspace(0.0, 0.70, n: 300) |> Nx.to_list() do
+    ai = ki + 1
+    bi = ni - ki + 1
+
+    log_p =
+      Beta.logpdf(Nx.tensor(theta), %{alpha: Nx.tensor(ai * 1.0), beta: Nx.tensor(bi * 1.0)})
+      |> Nx.to_number()
+
+    %{theta: theta, density: :math.exp(log_p), rule: rule}
+  end
+
+Vl.new(width: 600, height: 320, title: "Posterior TP rate — five IDS rules")
+|> Vl.data_from_values(multi_rule_data)
+|> Vl.mark(:line, stroke_width: 2)
+|> Vl.encode_field(:x, "theta", type: :quantitative, title: "θ (true positive rate)")
+|> Vl.encode_field(:y, "density", type: :quantitative, title: "p(θ|k,n)")
+|> Vl.encode_field(:color, "rule", type: :nominal)
+```
+
+Read the colors. Two rules (SID-1042 and SID-1103) have TP rates near 50% —
+they are producing actionable signal. Two rules (SID-1087 and SID-1229) have
+TP rates near 3-7% — they are almost pure noise. SID-1001 sits in between.
+
+The width of each curve tells you how confident you are. SID-1001 (200
+investigations) has a tighter posterior than SID-1229 (120 investigations).
+More data → less uncertainty. This is obvious in retrospect. It is not
+obvious from a point estimate.
+
+**The operational question:** which rules do you keep, which do you tune,
+and which do you disable? The posteriors give you a principled answer:
+
+* **SID-1087** (3.3% TP rate, tight posterior): disable or rewrite. You are
+  confident it's noise.
+* **SID-1103** (52% TP rate, moderate posterior): keep. Investigate further
+  to tighten the interval.
+* **SID-1001** (21.5% TP rate, moderate posterior): tune. The rule catches
+  real attacks, but 4 in 5 alerts are wasted analyst time.
+
+## Sampling from the Posterior — Alert Volume Projections
+
+If the true TP rate for SID-1001 is θ, and the rule fires ~850 alerts per
+quarter, then the expected number of real attacks caught is `850 × θ`. What
+is the posterior distribution over that count?
+
+Draw samples from Beta(44, 158) and multiply each by 850.
+
+```elixir
+n_samples = 5_000
+beta_params = %{alpha: Nx.tensor(alpha * 1.0), beta: Nx.tensor(beta_param * 1.0)}
+seed_state = :rand.seed_s(:exsss, 42)
+
+{samples, _final_rng} =
+  Enum.reduce(1..n_samples, {[], seed_state}, fn _, {acc, rng} ->
+    {x, rng} = Beta.sample(beta_params, rng)
+    {[Nx.to_number(x) | acc], rng}
+  end)
+
+samples = Enum.reverse(samples)
+
+# Transform: expected real attacks per quarter
+quarterly_alerts = 847
+real_attacks = Enum.map(samples, fn theta -> quarterly_alerts * theta end)
+
+%{
+  expected_real_attacks: Float.round(Enum.sum(real_attacks) / n_samples, 1),
+  ci_lo: Float.round(Enum.sort(real_attacks) |> Enum.at(round(0.025 * n_samples)), 1),
+  ci_hi: Float.round(Enum.sort(real_attacks) |> Enum.at(round(0.975 * n_samples)), 1)
+}
+```
+
+```elixir
+attack_data = Enum.map(real_attacks, fn ra -> %{real_attacks: ra} end)
+
+Vl.new(width: 600, height: 240, title: "Expected real attacks caught per quarter — SID-2024-1001")
+|> Vl.data_from_values(attack_data)
+|> Vl.mark(:bar, color: "#e45756", opacity: 0.7)
+|> Vl.encode_field(:x, "real_attacks",
+  type: :quantitative,
+  bin: %{maxbins: 40},
+  title: "real attacks caught per quarter"
+)
+|> Vl.encode_field(:y, "real_attacks", type: :quantitative, aggregate: :count)
+```
+
+This is what the SOC manager needs: "Rule SID-1001 catches between **136 and
+232 real attacks per quarter** (95% CI). If you disable it, you lose
+approximately **184** detections." That number — not the vendor's claimed
+detection rate, not the raw alert count — is the operationally relevant
+quantity. And it comes with an honest uncertainty bound.
+
+## What This Tells You
+
+* **The base rate dominates.** A rule with 95% TPR and 5% FPR produces
+  1.9% true positives when attacks are 0.1% of traffic. Every SOC analyst
+  knows this in their bones. Now you can calculate it.
+* **Stacking independent evidence multiplies the odds.** Requiring two
+  rules to both fire raises the posterior from 1.9% to 14.6%. This is
+  Bayesian updating — and it is why correlation engines work, when they work.
+* **The posterior is the answer.** Not the vendor's claimed detection rate.
+  Not the sample proportion from 200 investigations. The full posterior
+  density, with uncertainty that reflects how much data you have.
+* **Priors encode trust.** A flat prior says "I have no prior information."
+  A strong vendor prior says "I trust the vendor's 50,000-sample test more
+  than my 200 investigations." The posterior negotiates between them.
+* **Comparing rules is trivial.** Five posteriors on one plot tell you which
+  rules to keep, which to tune, and which to disable — with calibrated
+  confidence, not gut feeling.
+
+## Study Guide
+
+Each exercise is anchored to a specific cell above. Modify it, re-run the
+notebook, and answer the question.
+
+1. **Change the base rate to 1%** (a pre-filtered subnet where attacks are
+   more common). How does the single-rule posterior P(attack|alert) change?
+   At what base rate does the 95%-accurate rule become operationally useful
+   (say, >50% posterior)?
+
+2. **SID-1087 fired 2,241 alerts and you investigated 180 — only 6 true
+   positives.** Suppose you investigated 500 instead and found 20 true
+   positives (same rate). How does the posterior width change? At what
+   sample size would you be confident enough to disable the rule?
+
+3. **You want to compare SID-1042 and SID-1103.** Both have ~50% TP rates,
+   but different investigation counts (150 vs 100). Compute `P(θ_1042 >
+   θ_1103)` by drawing paired samples from both posteriors and counting
+   how often Rule 1042 wins. Is there meaningful evidence that one rule
+   is better?
+
+4. **The vendor updates their rule and claims the new version has a 40%
+   TP rate** (down from 95%, but more honest). Encode this as a
+   `Beta(40, 60)` prior (effective sample size 100). After your 200
+   investigations (43 TP), where does the posterior sit? How much does the
+   vendor's revised estimate change your conclusion?
+
+5. **(Optional, harder.)** Compute the **expected information gain** from
+   investigating 50 more alerts for SID-1001. Compare the posterior width
+   with `n=200` vs `n=250`. Is the narrowing worth 50 analyst-hours?
+
+## Literature
+
+* **Gelman, Carlin, Stern, Dunson, Vehtari, Rubin.** *Bayesian Data
+  Analysis*, 3rd ed., §2.1–2.4. The mathematical foundation for everything
+  in this notebook.
+* **Axelsson, S.** (2000). "The base-rate fallacy and the difficulty of
+  intrusion detection." *ACM TISSEC* 3(3):186-205. The original paper on
+  base rate neglect in IDS — the formal argument behind the 1.9% calculation.
+* **Vehtari, A.** BDA Python demos, `demos_ch2/`. The placenta previa
+  example that this notebook parallels.
+
+### Where to Go Next
+
+* `notebooks/bda/ch02_beta_binomial.livemd` — the same Beta-Binomial model
+  on medical data. Compare the structure: same math, different domain.
+* `notebooks/bda-cyber/ch05_eight_socs.livemd` — when you have multiple
+  offices with different incident rates, hierarchical models borrow strength
+  across sites. The "schools" of cybersecurity.
+* `notebooks/bda-cyber/ch09_incident_response.livemd` — the posteriors
+  from this notebook feed directly into decision theory. "Given this TP rate
+  and this base rate, should I escalate?"

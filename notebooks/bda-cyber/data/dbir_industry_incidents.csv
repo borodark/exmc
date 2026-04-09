@@ -1,0 +1,16 @@
+sector,web_app,privilege_misuse,lost_stolen,dos,crimeware,pos,misc,total,reporting_quality
+Healthcare,189,166,78,11,56,5,193,698,high
+Finance,453,54,42,233,156,34,121,1093,high
+Retail,87,12,21,45,89,143,34,431,medium
+Manufacturing,42,8,15,18,67,3,33,186,low
+Education,134,23,45,67,12,4,27,312,medium
+Government,198,87,32,45,23,2,33,420,high
+Technology,234,12,18,89,56,8,39,456,high
+Utilities,23,4,8,12,34,2,15,98,low
+Professional,112,34,22,56,45,6,28,303,medium
+Entertainment,67,8,14,23,34,12,18,176,low
+Transportation,45,6,12,34,23,3,21,144,low
+Accommodation,78,5,16,12,56,67,14,248,medium
+Mining,12,3,5,8,15,1,8,52,low
+Agriculture,8,2,4,6,12,1,6,39,low
+Real_Estate,34,7,9,15,18,4,11,98,low

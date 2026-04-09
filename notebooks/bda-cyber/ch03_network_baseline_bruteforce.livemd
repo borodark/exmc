@@ -1,0 +1,425 @@
+# BDA-Cyber Chapter 3 — Network Baselines and Brute Force
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Chapter 2 gave you one parameter and a conjugate update. Real security
+data has at least two unknowns — a center and a spread — and sometimes
+the data fight back. This chapter walks three problems of increasing
+difficulty:
+
+1. **DNS query length baseline** — normal model with unknown μ and σ².
+   What does "normal" look like on your network? If you don't know the
+   baseline, you can't detect deviation.
+2. **DNS with DGA contamination** — the same data with adversarial
+   outliers. Domain Generation Algorithm domains are longer and more
+   random than legitimate domains. The normal model breaks, visibly.
+   This is the security version of Newcomb's light-speed outliers.
+3. **Brute force dose-response** — a logistic model: as the number of
+   failed login attempts increases, what is the probability that the
+   account is under attack? A 2D non-conjugate posterior computed on
+   a grid, identical in structure to BDA3's bioassay.
+
+## Part 1 — DNS Query Length Baseline
+
+**Data:** Domain name lengths (in characters) from 100 DNS queries
+sampled from a corporate resolver during a normal business hour. No
+known malicious activity during this window.
+
+```elixir
+# Normal DNS query lengths — sampled from corporate resolver
+# Legitimate domains: google.com (10), mail.yahoo.com (14), etc.
+dns_lengths = [
+  10, 14, 11, 18, 12, 15, 9, 22, 13, 11,
+  16, 10, 14, 20, 12, 8, 17, 13, 11, 15,
+  19, 12, 10, 14, 16, 13, 11, 21, 9, 14,
+  12, 15, 18, 10, 13, 11, 16, 14, 12, 17,
+  10, 13, 15, 11, 14, 12, 20, 9, 16, 13,
+  11, 14, 10, 18, 12, 15, 13, 11, 17, 14,
+  12, 16, 10, 13, 19, 11, 14, 15, 12, 18,
+  10, 13, 11, 16, 14, 12, 9, 15, 17, 13,
+  11, 14, 10, 12, 18, 16, 13, 15, 11, 14,
+  20, 12, 10, 13, 17, 11, 14, 15, 12, 16
+]
+
+n = length(dns_lengths)
+y_mean = Enum.sum(dns_lengths) / n
+sum_sq_dev = Enum.reduce(dns_lengths, 0.0, fn yi, acc -> acc + (yi - y_mean) ** 2 end)
+s2 = sum_sq_dev / (n - 1)
+
+%{
+  n: n,
+  sample_mean: Float.round(y_mean, 2),
+  sample_variance: Float.round(s2, 2),
+  sample_sd: Float.round(:math.sqrt(s2), 2)
+}
+```
+
+### The Normal Model
+
+Place vague priors on μ and σ²:
+
+$$
+p(\mu, \sigma^2) \propto (\sigma^2)^{-1} \quad \text{(Jeffreys prior)}
+$$
+
+The posterior factorizes:
+
+$$
+\sigma^2 \mid y \sim \text{Inv-}\chi^2(n-1,\; s^2)
+$$
+$$
+\mu \mid \sigma^2, y \sim \text{Normal}\!\left(\bar{y},\; \sigma^2/n\right)
+$$
+
+Sample: draw σ² first, then μ conditional on σ².
+
+```elixir
+n_draws = 4_000
+rng = :rand.seed_s(:exsss, 42)
+
+{joint_samples, _} =
+  Enum.reduce(1..n_draws, {[], rng}, fn _, {acc, rng} ->
+    # Draw sigma^2 from scaled inverse chi-squared
+    # = s2 * (n-1) / chi2(n-1)
+    # chi2(n-1) = sum of (n-1) standard normals squared
+    {chi2, rng} =
+      Enum.reduce(1..(n - 1), {0.0, rng}, fn _, {sum, r} ->
+        {z, r} = :rand.normal_s(r)
+        {sum + z * z, r}
+      end)
+
+    sigma2 = s2 * (n - 1) / chi2
+    sigma = :math.sqrt(sigma2)
+
+    # Draw mu from Normal(y_mean, sigma^2 / n)
+    {z, rng} = :rand.normal_s(rng)
+    mu = y_mean + sigma / :math.sqrt(n) * z
+
+    {[%{mu: mu, sigma: sigma} | acc], rng}
+  end)
+
+joint_samples = Enum.reverse(joint_samples)
+
+mu_samples = Enum.map(joint_samples, & &1.mu)
+sigma_samples = Enum.map(joint_samples, & &1.sigma)
+
+%{
+  mu_mean: Float.round(Enum.sum(mu_samples) / n_draws, 2),
+  sigma_mean: Float.round(Enum.sum(sigma_samples) / n_draws, 2),
+  interpretation: "Baseline DNS length: ~#{Float.round(Enum.sum(mu_samples) / n_draws, 1)} ± #{Float.round(Enum.sum(sigma_samples) / n_draws, 1)} chars"
+}
+```
+
+```elixir
+mu_data = Enum.map(mu_samples, fn m -> %{mu: m} end)
+
+Vl.new(width: 400, height: 220, title: "Posterior of μ (mean DNS query length)")
+|> Vl.data_from_values(mu_data)
+|> Vl.mark(:bar, color: "#4c78a8", opacity: 0.7)
+|> Vl.encode_field(:x, "mu", type: :quantitative, bin: %{maxbins: 40}, title: "μ (chars)")
+|> Vl.encode_field(:y, "mu", type: :quantitative, aggregate: :count)
+```
+
+This posterior is your baseline. "Normal DNS traffic on our network has a
+mean query length of ~13.5 characters with σ ≈ 3.2." Any monitoring
+system that flags queries as anomalous needs to know these two numbers
+and their uncertainty.
+
+## Part 2 — DGA Contamination (The Newcomb Problem)
+
+Now the adversary shows up. Domain Generation Algorithms (DGAs) create
+domains like `xk9f2mq1a3bv.ru` (15 chars) or `a7hq92kf1nb3s0x8.co` (20
+chars). They are **longer and higher-entropy** than legitimate domains.
+
+Mix 10 DGA domains into the 100 legitimate queries:
+
+```elixir
+# DGA-generated domains — longer, random character strings
+dga_additions = [32, 28, 35, 30, 27, 33, 29, 31, 34, 26]
+
+contaminated = dns_lengths ++ dga_additions
+n_contam = length(contaminated)
+y_mean_c = Enum.sum(contaminated) / n_contam
+s2_c =
+  Enum.reduce(contaminated, 0.0, fn yi, acc -> acc + (yi - y_mean_c) ** 2 end) /
+    (n_contam - 1)
+
+%{
+  n: n_contam,
+  sample_mean: Float.round(y_mean_c, 2),
+  sample_sd: Float.round(:math.sqrt(s2_c), 2),
+  dga_fraction: "#{length(dga_additions)}/#{n_contam} = #{Float.round(length(dga_additions) / n_contam * 100, 1)}%",
+  mean_shift: Float.round(y_mean_c - y_mean, 2)
+}
+```
+
+The 10 DGA domains shifted the mean by ~1.5 characters and inflated the
+variance. A normal model fit to this data will have a wider posterior on
+both μ and σ — and it won't tell you *why*. The Gaussian assumption
+absorbs the outliers into the tails instead of flagging them.
+
+```elixir
+# Overlay histograms: clean vs contaminated
+clean_data = Enum.map(dns_lengths, fn l -> %{length: l, source: "Legitimate"} end)
+dga_data = Enum.map(dga_additions, fn l -> %{length: l, source: "DGA"} end)
+
+Vl.new(width: 500, height: 240, title: "DNS query lengths: legitimate vs DGA")
+|> Vl.data_from_values(clean_data ++ dga_data)
+|> Vl.mark(:bar, opacity: 0.7)
+|> Vl.encode_field(:x, "length", type: :quantitative, bin: %{maxbins: 25}, title: "Query length (chars)")
+|> Vl.encode_field(:y, "length", type: :quantitative, aggregate: :count)
+|> Vl.encode_field(:color, "source", type: :nominal)
+```
+
+The two populations are visible by eye. The normal model cannot
+distinguish them — it sees one wide Gaussian. This is the same lesson as
+Newcomb's light-speed data in BDA3 Ch 3: **if your data have outliers,
+the normal model is wrong, and it fails silently.** Posterior predictive
+checks (Ch 6) will detect this misfit formally.
+
+The fix, foreshadowed here and developed in later chapters: a **mixture
+model** (two Gaussians — legitimate + DGA) or a **robust model**
+(Student-t, which has heavier tails). Both are natural extensions of
+this chapter's framework.
+
+## Part 3 — Brute Force Dose-Response
+
+How many failed login attempts does it take before you're confident an
+account is under attack?
+
+This is a **logistic dose-response** model, identical in structure to
+BDA3's bioassay. The "dose" is the number of failed logins. The
+"response" is whether the authentication source is confirmed malicious
+(brute force) or benign (user forgot password).
+
+```elixir
+# Observed data: batches of accounts grouped by failed-login count
+# For each batch: how many total, how many confirmed brute force
+failed_attempts = [1, 3, 5, 10, 20]
+n_accounts =     [200, 150, 80, 40, 15]
+n_brute_force =  [2,   8,  18, 25, 14]
+
+data_table =
+  Enum.zip([failed_attempts, n_accounts, n_brute_force])
+  |> Enum.map(fn {x, n, k} ->
+    %{failed_attempts: x, accounts: n, confirmed_brute_force: k, rate: Float.round(k / n, 3)}
+  end)
+
+data_table
+```
+
+The dose-response pattern is clear: at 1 failed attempt, only 1% of
+accounts are under attack (users mistype passwords). At 20 attempts,
+93% are confirmed brute force. The logistic model captures this:
+
+$$
+P(\text{brute force} \mid x) = \text{logit}^{-1}(\alpha + \beta x)
+= \frac{1}{1 + e^{-(\alpha + \beta x)}}
+$$
+
+where `α` controls the baseline (false-login rate at x = 0) and `β`
+controls how fast the probability rises with additional failed attempts.
+
+### Grid Posterior
+
+No conjugacy here. We compute `p(α, β | data)` on a 2D grid:
+
+```elixir
+# Grid over (alpha, beta)
+alpha_grid = Nx.linspace(-6.0, 0.0, n: 200) |> Nx.to_list()
+beta_grid = Nx.linspace(-0.1, 1.0, n: 200) |> Nx.to_list()
+
+# Log-likelihood: binomial at each dose level
+log_lik = fn a, b ->
+  Enum.zip([failed_attempts, n_accounts, n_brute_force])
+  |> Enum.reduce(0.0, fn {x, n, k}, acc ->
+    logit = a + b * x
+    # Numerically stable log(1 / (1 + exp(-logit)))
+    log_p = if logit >= 0, do: -:math.log(1 + :math.exp(-logit)), else: logit - :math.log(1 + :math.exp(logit))
+    log_1mp = if logit >= 0, do: -logit - :math.log(1 + :math.exp(-logit)), else: -:math.log(1 + :math.exp(logit))
+    acc + k * log_p + (n - k) * log_1mp
+  end)
+end
+
+# Evaluate on grid (flat prior)
+grid_values =
+  for a <- alpha_grid, b <- beta_grid do
+    ll = log_lik.(a, b)
+    {a, b, ll}
+  end
+
+max_ll = grid_values |> Enum.map(fn {_, _, ll} -> ll end) |> Enum.max()
+
+grid_posterior =
+  Enum.map(grid_values, fn {a, b, ll} ->
+    %{alpha: a, beta: b, density: :math.exp(ll - max_ll)}
+  end)
+
+# Marginal posterior of beta by summing over alpha
+beta_marginal =
+  grid_posterior
+  |> Enum.group_by(& &1.beta)
+  |> Enum.map(fn {b, rows} ->
+    total = Enum.reduce(rows, 0.0, fn r, acc -> acc + r.density end)
+    %{beta: b, density: total}
+  end)
+  |> Enum.sort_by(& &1.beta)
+
+%{grid_points: length(grid_values), peak_alpha_beta: grid_values |> Enum.max_by(fn {_, _, ll} -> ll end) |> then(fn {a, b, _} -> {Float.round(a, 2), Float.round(b, 2)} end)}
+```
+
+```elixir
+Vl.new(width: 500, height: 280, title: "Marginal posterior of β (login-attempt effect)")
+|> Vl.data_from_values(beta_marginal)
+|> Vl.mark(:area, color: "#54a24b", opacity: 0.6)
+|> Vl.encode_field(:x, "beta", type: :quantitative, title: "β (log-odds per failed attempt)")
+|> Vl.encode_field(:y, "density", type: :quantitative, title: "p(β|data)")
+```
+
+The posterior on β is positive and bounded away from zero — failed login
+attempts *do* predict brute force, and the data are precise enough to
+say so with confidence.
+
+### The LD50 — How Many Attempts Before 50% Probability?
+
+In toxicology, the LD50 is the dose that kills half the subjects.
+In security, it's the **number of failed logins at which there's a 50%
+probability of brute force.** Computed as `-α/β`:
+
+```elixir
+# Sample (alpha, beta) pairs from grid posterior via inverse-CDF
+total_mass = Enum.reduce(grid_posterior, 0.0, fn r, acc -> acc + r.density end)
+
+# Normalize and build CDF
+normalized =
+  grid_posterior
+  |> Enum.map(fn r -> %{r | density: r.density / total_mass} end)
+
+{cdf, _} =
+  Enum.map_reduce(normalized, 0.0, fn r, acc ->
+    new = acc + r.density
+    {%{r | density: new}, new}
+  end)
+
+# Sample 3000 (alpha, beta) pairs
+:rand.seed(:exsss, 42)
+
+grid_samples =
+  for _ <- 1..3_000 do
+    u = :rand.uniform()
+    match = Enum.find(cdf, fn r -> r.density >= u end) || List.last(cdf)
+    {match.alpha, match.beta}
+  end
+
+# Compute LD50 = -alpha / beta for each sample
+ld50_samples =
+  grid_samples
+  |> Enum.filter(fn {_a, b} -> b > 0.01 end)
+  |> Enum.map(fn {a, b} -> -a / b end)
+  |> Enum.filter(fn x -> x > 0 and x < 50 end)
+
+ld50_mean = Enum.sum(ld50_samples) / length(ld50_samples)
+
+%{
+  ld50_mean: Float.round(ld50_mean, 1),
+  interpretation: "50% probability of brute force at ~#{Float.round(ld50_mean, 0)} failed attempts",
+  n_valid_samples: length(ld50_samples)
+}
+```
+
+```elixir
+ld50_data = Enum.map(ld50_samples, fn x -> %{ld50: x} end)
+
+Vl.new(width: 500, height: 220, title: "Posterior of LD50 (failed attempts for 50% brute force probability)")
+|> Vl.data_from_values(ld50_data)
+|> Vl.mark(:bar, color: "#e45756", opacity: 0.7)
+|> Vl.encode_field(:x, "ld50", type: :quantitative, bin: %{maxbins: 30}, title: "Failed attempts")
+|> Vl.encode_field(:y, "ld50", type: :quantitative, aggregate: :count)
+```
+
+The posterior of the LD50 tells the security architect: **set your lockout
+threshold around this number.** Too low → too many false lockouts (users
+who mistyped their password twice). Too high → too many successful brute
+force attacks. The posterior uncertainty tells you how confident that
+recommendation is.
+
+## What This Tells You
+
+* **The normal model is a baseline, not an endpoint.** It tells you what
+  "normal" looks like. When adversarial data contaminates the sample
+  (DGA domains, C2 beacons), the normal model breaks. You need heavier
+  tails or a mixture model.
+* **Outliers inflate variance silently.** The normal fit to contaminated
+  DNS data widens σ but doesn't flag the outliers. Posterior predictive
+  checks (Ch 6) will catch this. Looking at the histogram catches it
+  faster.
+* **The logistic dose-response is the lockout-threshold model.** The
+  posterior on the LD50 gives you a principled lockout threshold with
+  uncertainty. "Lock out after 7 ± 2 attempts" is a different
+  recommendation from "lock out after 5" — and a more honest one.
+* **Grid posteriors work in 2D.** The brute-force model has two
+  parameters. We evaluated on a 200×200 grid in seconds. At 5
+  parameters, the grid has 200⁵ = 3.2 × 10¹¹ cells. This is where
+  MCMC (Ch 5, Ch 11) takes over.
+
+## Study Guide
+
+1. **Double the DGA fraction** — mix 20 DGA domains into 100 legitimate.
+   How much does the normal posterior on μ shift? At what contamination
+   fraction does the mean shift exceed 1 standard deviation?
+
+2. **Fit the contaminated data with a Student-t model** (ν = 4 degrees
+   of freedom). Compare the posterior on μ to the normal model. Does the
+   robust model resist the DGA outliers?
+
+3. **The lockout threshold is currently set at 5.** Using the logistic
+   posterior, compute P(brute force | 5 attempts). Is this above or
+   below 50%? What is the false lockout rate (P(benign | 5 attempts))?
+
+4. **Add a sixth dose level:** 50 failed attempts, 10 accounts, 10
+   confirmed brute force (100% at that level). How does this extreme
+   point change the posterior on β? Does the LD50 move?
+
+5. **(Hard.)** Compute a **posterior predictive dose-response curve** —
+   for each x in 1..30, draw 100 (α, β) samples and compute the mean
+   and 90% interval of P(brute force | x). Plot with uncertainty bands.
+
+## Literature
+
+* **Gelman et al.** *BDA3*, §3.7 (bioassay example). The structural
+  template for the logistic dose-response.
+* **Plonka, D. & Barford, P.** (2011). "Context-aware clustering of DNS
+  query traffic." *ACM IMC*. DNS length distributions in the wild.
+* **Antonakakis, M. et al.** (2012). "From Throw-Away Traffic to Bots."
+  *USENIX Security*. DGA domain characteristics and detection.
+
+### Where to Go Next
+
+* `notebooks/bda/ch03_normal_and_bioassay.livemd` — the same three models
+  on windshield hardness, Newcomb, and bioassay data.
+* `notebooks/bda-cyber/ch04_laplace_bruteforce.livemd` — Laplace
+  approximation for the logistic model. Fast, closed-form-ish.
+* `notebooks/bda-cyber/ch06_threat_model_ppc.livemd` — posterior
+  predictive checks that detect the DGA contamination formally.

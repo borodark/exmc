@@ -1,0 +1,470 @@
+# BDA-Cyber Chapter 9 — Incident Response: Contain, Investigate, or Ignore?
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+It is 2:00 AM. Your SIEM fires a high-severity alert. The EDR confirms
+anomalous process activity on a production database server. The IDS logged
+an outbound connection to an IP flagged in threat intelligence.
+
+You have three choices:
+
+1. **Contain immediately.** Isolate the server from the network. Cost:
+   $50,000 in downtime — the application goes offline, SLA penalties
+   apply, the on-call team works through the night. If it was a false
+   positive, you spent $50K for nothing.
+
+2. **Investigate first.** Spend 4 hours collecting forensic data before
+   deciding. Cost: $5,000 in analyst time. Risk: if it *is* an active
+   breach, the attacker has 4 more hours to exfiltrate data, move
+   laterally, or deploy ransomware. A breach that progresses for 4 hours
+   can cost $500,000 more than one contained immediately.
+
+3. **Ignore.** Mark the alert as a false positive and go back to sleep.
+   Cost: $0 now. If it was real: $2,000,000 in breach costs (incident
+   response retainer, notification, regulatory fines, reputation damage).
+
+Every SOC analyst makes this decision dozens of times a week. Almost
+none of them frame it as what it actually is: a **Bayesian decision
+problem** where the optimal action depends on three things:
+
+1. Your **posterior belief** that this is a real breach (informed by the
+   alerts, the indicators, the context).
+2. The **cost of each action** in each possible world (breach vs. false
+   positive).
+3. The **asymmetry** of the consequences.
+
+The math is identical to BDA3's jar of coins. The stakes are different.
+
+## The Belief State
+
+You have evidence from three sources. Your posterior belief that this is
+a real active breach is a probability `p`. Where does `p` come from?
+
+From Ch 2 of this track. The base rate of real breaches on your network
+is low (say 0.2% of high-severity alerts). The SIEM alert has a 92% TPR
+and 8% FPR. The EDR confirmation has a 85% TPR and 3% FPR. The TI IP
+match has a 70% TPR and 1% FPR. Bayesian updating across independent
+evidence sources:
+
+```elixir
+# Prior: base rate of real breaches among high-severity alerts
+prior = 0.002
+
+# Evidence: three independent sources (TPR, FPR)
+sources = [
+  %{name: "SIEM alert", tpr: 0.92, fpr: 0.08},
+  %{name: "EDR anomaly", tpr: 0.85, fpr: 0.03},
+  %{name: "TI IP match", tpr: 0.70, fpr: 0.01}
+]
+
+# Sequential Bayesian update
+posterior =
+  Enum.reduce(sources, prior, fn %{tpr: tpr, fpr: fpr}, p ->
+    p_evidence = tpr * p + fpr * (1 - p)
+    tpr * p / p_evidence
+  end)
+
+# Also compute what each source contributes
+update_trace =
+  Enum.scan(sources, {prior, "Prior"}, fn %{name: name, tpr: tpr, fpr: fpr}, {p, _} ->
+    p_evidence = tpr * p + fpr * (1 - p)
+    new_p = tpr * p / p_evidence
+    {new_p, name}
+  end)
+
+all_steps = [{prior, "Prior (base rate)"} | update_trace]
+
+for {p, name} <- all_steps do
+  %{step: name, probability: Float.round(p, 4)}
+end
+```
+
+Watch the posterior evolve as evidence stacks:
+
+- **Prior:** 0.2% (base rate)
+- **After SIEM:** jumps to ~2% (the SIEM's FPR is high, so one alert
+  alone doesn't move much)
+- **After EDR:** jumps to ~30–40% (EDR's 3% FPR is much tighter)
+- **After TI match:** jumps to ~90%+ (TI's 1% FPR makes benign
+  coincidence very unlikely)
+
+Three independent sources, each mediocre alone, combine to near-certainty.
+This is the power of Bayesian evidence fusion — and it is not how most
+SIEM correlation engines work.
+
+```elixir
+step_data =
+  all_steps
+  |> Enum.with_index()
+  |> Enum.map(fn {{p, name}, i} -> %{step: i, label: name, probability: p} end)
+
+Vl.new(width: 500, height: 280, title: "Posterior probability of active breach")
+|> Vl.data_from_values(step_data)
+|> Vl.mark(:bar, color: "#e45756")
+|> Vl.encode_field(:x, "label", type: :nominal, title: "Evidence source",
+  sort: nil
+)
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "P(breach)")
+```
+
+## The Cost Structure
+
+Now the decision theory. Define the costs:
+
+```elixir
+costs = %{
+  # Cost of containment (server isolation)
+  contain_if_breach: 50_000,       # contained quickly, limited damage
+  contain_if_false: 50_000,        # downtime for nothing
+
+  # Cost of investigation first
+  investigate_if_breach: 55_000,   # $5K analyst time + $50K eventual containment
+  investigate_breach_progresses: 550_000,  # if breach progresses during 4hr investigation
+
+  # Cost of ignoring
+  ignore_if_breach: 2_000_000,     # full breach: IR, notification, fines, reputation
+  ignore_if_false: 0,              # nothing happens
+
+  # Probability breach progresses during investigation (attacker is fast)
+  p_progress: 0.30
+}
+```
+
+The asymmetry is extreme. Ignoring a false positive costs nothing.
+Ignoring a real breach costs $2M. Containing a false positive costs $50K.
+Containing a real breach costs $50K (you caught it early). The **false
+negative is 40× more expensive than the false positive.**
+
+## Expected Loss for Each Action
+
+For each action, compute the expected loss under the posterior `p`:
+
+$$
+\mathrm{EL}(\text{action}) = \sum_{\text{states}} P(\text{state}) \times \text{Cost}(\text{action}, \text{state})
+$$
+
+```elixir
+p = posterior
+
+# Expected loss of each action
+el_contain =
+  p * costs.contain_if_breach +
+  (1 - p) * costs.contain_if_false
+
+el_investigate =
+  p * (costs.p_progress * costs.investigate_breach_progresses +
+       (1 - costs.p_progress) * costs.investigate_if_breach) +
+  (1 - p) * 5_000   # analyst time even if false
+
+el_ignore =
+  p * costs.ignore_if_breach +
+  (1 - p) * costs.ignore_if_false
+
+best_action =
+  [{el_contain, "Contain"}, {el_investigate, "Investigate"}, {el_ignore, "Ignore"}]
+  |> Enum.min_by(fn {loss, _} -> loss end)
+
+%{
+  expected_loss_contain: "$#{:erlang.float_to_binary(el_contain, decimals: 0)}",
+  expected_loss_investigate: "$#{:erlang.float_to_binary(el_investigate, decimals: 0)}",
+  expected_loss_ignore: "$#{:erlang.float_to_binary(el_ignore, decimals: 0)}",
+  optimal_action: elem(best_action, 1),
+  posterior: Float.round(p, 3)
+}
+```
+
+At ~90% posterior probability of breach, the decision is unambiguous:
+**contain immediately.** The expected loss of containment (~$50K) is far
+lower than the expected loss of ignoring (~$1.8M) or even investigating
+first (~$150K+, because of the 30% chance the breach progresses during
+the 4-hour investigation).
+
+## How the Decision Changes with Belief
+
+But what if the evidence is weaker? What if only the SIEM fired, without
+EDR or TI confirmation? Then your posterior is ~2%, not ~90%. Does the
+optimal action change?
+
+Plot expected loss as a function of posterior probability:
+
+```elixir
+p_range = Nx.linspace(0.0, 1.0, n: 200) |> Nx.to_list()
+
+decision_data =
+  Enum.flat_map(p_range, fn p ->
+    el_c = p * costs.contain_if_breach + (1 - p) * costs.contain_if_false
+
+    el_i =
+      p * (costs.p_progress * costs.investigate_breach_progresses +
+           (1 - costs.p_progress) * costs.investigate_if_breach) +
+      (1 - p) * 5_000
+
+    el_ig = p * costs.ignore_if_breach + (1 - p) * costs.ignore_if_false
+
+    [
+      %{p: p, expected_loss: el_c, action: "Contain ($50K)"},
+      %{p: p, expected_loss: el_i, action: "Investigate ($5K + risk)"},
+      %{p: p, expected_loss: el_ig, action: "Ignore ($0 or $2M)"}
+    ]
+  end)
+
+Vl.new(width: 600, height: 360, title: "Expected loss vs posterior probability of breach")
+|> Vl.data_from_values(decision_data)
+|> Vl.mark(:line, stroke_width: 2)
+|> Vl.encode_field(:x, "p", type: :quantitative, title: "P(breach)")
+|> Vl.encode_field(:y, "expected_loss", type: :quantitative, title: "Expected loss ($)")
+|> Vl.encode_field(:color, "action", type: :nominal)
+```
+
+The plot reveals the **decision thresholds** — the crossover points where
+the optimal action switches:
+
+```elixir
+# Find crossover: Ignore → Investigate
+# EL(ignore) = EL(investigate) when:
+# p * 2M = p * (0.3 * 550K + 0.7 * 55K) + (1-p) * 5K
+# Solve for p
+el_investigate_fn = fn p ->
+  p * (costs.p_progress * costs.investigate_breach_progresses +
+       (1 - costs.p_progress) * costs.investigate_if_breach) +
+  (1 - p) * 5_000
+end
+
+el_ignore_fn = fn p -> p * costs.ignore_if_breach end
+el_contain_fn = fn p -> p * costs.contain_if_breach + (1 - p) * costs.contain_if_false end
+
+# Brute force search for crossovers
+crossovers =
+  p_range
+  |> Enum.chunk_every(2, 1, :discard)
+  |> Enum.reduce(%{}, fn [p1, p2], acc ->
+    # Ignore → Investigate crossover
+    acc =
+      if el_ignore_fn.(p1) < el_investigate_fn.(p1) and el_ignore_fn.(p2) >= el_investigate_fn.(p2) do
+        Map.put(acc, :ignore_to_investigate, Float.round((p1 + p2) / 2, 3))
+      else
+        acc
+      end
+
+    # Investigate → Contain crossover
+    if el_investigate_fn.(p1) < el_contain_fn.(p1) and el_investigate_fn.(p2) >= el_contain_fn.(p2) do
+      Map.put(acc, :investigate_to_contain, Float.round((p1 + p2) / 2, 3))
+    else
+      acc
+    end
+  end)
+
+crossovers
+|> Map.put(:interpretation,
+  "Below #{crossovers[:ignore_to_investigate] || "~0.3%"}: ignore. " <>
+  "Between #{crossovers[:ignore_to_investigate] || "~0.3%"} and #{crossovers[:investigate_to_contain] || "~25%"}: investigate. " <>
+  "Above #{crossovers[:investigate_to_contain] || "~25%"}: contain immediately."
+)
+```
+
+The thresholds depend entirely on the cost structure. With the numbers
+above, the typical result is:
+
+- **P(breach) < ~0.3%:** Ignore. The expected cost of a false positive
+  outweighs the expected cost of missing a rare breach.
+- **~0.3% < P(breach) < ~25%:** Investigate. Spend $5K in analyst time
+  to sharpen your belief before committing to $50K in containment.
+- **P(breach) > ~25%:** Contain immediately. The expected cost of delay
+  exceeds the cost of a false containment.
+
+**The 25% threshold means you should contain a server on a 1-in-4
+hunch.** That feels aggressive — until you do the math. A missed breach
+costs 40× more than a false containment. The asymmetry demands a low
+threshold.
+
+## Sensitivity Analysis — What If Breach Cost Changes?
+
+The decision thresholds shift with the cost structure. What if breach
+cost is $500K (a small company) instead of $2M (a regulated enterprise)?
+
+```elixir
+breach_costs = [500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000]
+
+sensitivity_data =
+  for bc <- breach_costs, p <- p_range do
+    el_c = p * costs.contain_if_breach + (1 - p) * costs.contain_if_false
+    el_ig = p * bc
+
+    %{
+      p: p,
+      contain: el_c,
+      ignore: el_ig,
+      breach_cost: "$#{div(bc, 1_000_000)}M"
+    }
+  end
+
+# Find containment threshold for each breach cost
+thresholds =
+  for bc <- breach_costs do
+    # Contain ≤ Ignore when: p * 50K + (1-p) * 50K ≤ p * bc
+    # 50K ≤ p * (bc - 50K + 50K) = p * bc ... wait, simplify:
+    # 50K ≤ p * bc ⟹ p ≥ 50K / bc
+    threshold = costs.contain_if_false / bc
+
+    %{
+      breach_cost: "$#{div(bc, 1_000_000)}M",
+      containment_threshold: "#{Float.round(threshold * 100, 1)}%",
+      meaning: "Contain if P(breach) > #{Float.round(threshold * 100, 1)}%"
+    }
+  end
+
+thresholds
+```
+
+| Breach Cost | Containment Threshold |
+|---|---|
+| $500K | ~10% |
+| $1M | ~5% |
+| $2M | ~2.5% |
+| $5M | ~1% |
+| $10M | ~0.5% |
+
+For a company facing $10M breach costs (healthcare, finance with
+regulatory penalties), the containment threshold is **0.5%**. You should
+isolate a server if you're even *half a percent sure* it's compromised.
+This is why hospitals and banks over-contain. The math demands it.
+
+## The Value of Better Detection
+
+How much is a better EDR worth? If the EDR's false positive rate drops
+from 3% to 1%, the posterior becomes tighter. Fewer false containments.
+More sleep for the on-call team.
+
+```elixir
+fpr_values = [0.10, 0.05, 0.03, 0.01, 0.005]
+
+detection_value =
+  for edr_fpr <- fpr_values do
+    # Recompute posterior with varying EDR FPR
+    updated_sources = [
+      %{tpr: 0.92, fpr: 0.08},   # SIEM (fixed)
+      %{tpr: 0.85, fpr: edr_fpr}, # EDR (varying)
+      %{tpr: 0.70, fpr: 0.01}    # TI (fixed)
+    ]
+
+    post =
+      Enum.reduce(updated_sources, prior, fn %{tpr: tpr, fpr: fpr}, p ->
+        p_evidence = tpr * p + fpr * (1 - p)
+        tpr * p / p_evidence
+      end)
+
+    el_c = post * costs.contain_if_breach + (1 - post) * costs.contain_if_false
+    el_ig = post * costs.ignore_if_breach
+
+    %{
+      edr_fpr: "#{Float.round(edr_fpr * 100, 1)}%",
+      posterior: Float.round(post, 3),
+      expected_loss_contain: "$#{:erlang.float_to_binary(el_c, decimals: 0)}",
+      expected_loss_ignore: "$#{:erlang.float_to_binary(el_ig, decimals: 0)}",
+      optimal: if(el_c < el_ig, do: "Contain", else: "Ignore")
+    }
+  end
+
+detection_value
+```
+
+This table is the **ROI calculation for buying better EDR.** If upgrading
+from 3% FPR to 1% FPR shifts the posterior enough to avoid one false
+containment per quarter ($50K saved) or catch one real breach faster
+($500K+ saved), the investment pays for itself. The numbers are right
+there in the expected-loss column.
+
+## What This Tells You
+
+* **A posterior is a belief. A decision is an action.** They are not the
+  same object. The decision is what you take to the incident commander.
+* **The optimal action depends on the cost asymmetry** as much as on
+  the posterior. False negatives cost 40× more than false positives in
+  breach scenarios. This asymmetry dominates the decision.
+* **Decision thresholds are lower than you'd expect.** With $2M breach
+  costs and $50K containment costs, you should contain at 2.5% posterior
+  probability. Four percent. Not fifty. Not ninety.
+* **Stacking independent evidence is the fastest way to sharpen the
+  posterior.** Three mediocre sources (SIEM + EDR + TI) combine to ~90%.
+  The marginal value of a fourth source depends on the third source's
+  FPR, not the fourth's TPR.
+* **The cost of better detection is quantifiable.** Reducing EDR FPR
+  from 3% to 1% changes the expected loss by a computable dollar amount.
+  That's the business case for the security budget.
+
+## Study Guide
+
+1. **Remove the TI IP match** (the third evidence source). With only
+   SIEM + EDR, what is the posterior? What is the optimal action now?
+   At what EDR FPR does the optimal action switch from "contain" to
+   "investigate"?
+
+2. **Change the investigation model.** Instead of a fixed 30% chance the
+   breach progresses, model it as a function of investigation time:
+   `p_progress(t) = 1 - exp(-0.1 * t)` where `t` is hours. At what
+   investigation duration does "investigate first" become worse than
+   "contain immediately" for a 50% posterior?
+
+3. **Add a fourth action: "Partial containment"** — isolate the server
+   from the internet but keep internal connectivity. Cost: $15K (less
+   downtime). But the attacker can still move laterally (50% chance of
+   $200K additional damage). Plot the expected loss curve for this
+   fourth option. Where does it become optimal?
+
+4. **Compute the Expected Value of Perfect Information (EVPI).** If you
+   could know *for certain* whether this was a breach before deciding,
+   what would your expected loss be? The difference between that and
+   your current expected loss is the maximum you should pay for a perfect
+   oracle. How does EVPI change with the posterior?
+
+5. **(Hard.)** Connect this to the Ch 5 hierarchical model. Suppose
+   your posterior on HQ's incident rate `θ_HQ` from the eight-SOCs model
+   is Normal(18, 4). Compute the expected cost of *not* increasing HQ's
+   security budget, under a loss function where each undetected incident
+   costs $100K. This is the budget version of the containment decision.
+
+## Literature
+
+* **Gelman et al.** *Bayesian Data Analysis*, 3rd ed., Chapter 9
+  (decision analysis). The framework: posterior × utility → optimal action.
+* **Axelsson, S.** (2000). "The base-rate fallacy and the difficulty of
+  intrusion detection." *ACM TISSEC* 3(3). The formal argument that
+  the base rate problem drives SOC economics.
+* **Ponemon Institute.** "Cost of a Data Breach Report," annual.
+  Industry-specific breach cost estimates that calibrate the loss function.
+* **Original Python demo:** `bda-ex-demos/demos_ch9/demo9_1.ipynb` (jar
+  of coins).
+
+### Where to Go Next
+
+* `notebooks/bda/ch09_decision_analysis.livemd` — the same framework on
+  the jar-of-coins problem. Compare the structure: same math, different
+  stakes.
+* `notebooks/bda-cyber/ch02_ids_rule_effectiveness.livemd` — where the
+  posteriors used in this notebook come from. The base rate calculation
+  and evidence stacking.
+* `notebooks/bda-cyber/ch05_eight_socs.livemd` — the hierarchical model
+  that produces the per-office incident rate posteriors feeding into
+  budget allocation decisions.

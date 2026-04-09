@@ -1,0 +1,269 @@
+# BDA-Cyber Chapter 4 — Laplace Approximation for Brute Force Detection
+
+## Setup
+
+```elixir
+# CPU only — no GPU required
+System.put_env("EXLA_CPU_ONLY", "true")
+System.put_env("CUDA_VISIBLE_DEVICES", "")
+
+Mix.install([
+  {:exmc, path: Path.expand("../../", __DIR__)},
+  {:exla, "~> 0.10"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Application.put_env(:exla, :clients, host: [platform: :host])
+Application.put_env(:exla, :default_client, :host)
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: EXLA, client: :host)
+
+alias VegaLite, as: Vl
+:ok
+```
+
+## Why This Matters
+
+Chapter 3 computed the brute-force logistic posterior on a 40,000-point
+grid. That took seconds for 2 parameters. But a model with 10
+parameters would need 10¹⁰ grid points. The grid approach dies
+exponentially.
+
+The **Laplace approximation** is the cheapest escape:
+
+1. Find the posterior mode (the MAP estimate) — by optimization.
+2. Compute the Hessian (curvature) at the mode.
+3. Approximate the posterior as a Gaussian centered at the mode with
+   covariance = inverse of the negative Hessian.
+
+This is "fit a bell curve to the peak of the posterior." It is wrong
+whenever the posterior is skewed, multimodal, or has heavy tails — but
+for many well-behaved models it is fast and surprisingly accurate.
+
+In security operations, speed matters. A Laplace approximation runs in
+milliseconds. A full MCMC run takes seconds to minutes. If you are
+scoring alerts in real time, the Laplace might be good enough.
+
+## The Brute Force Model (Recap)
+
+From Ch 3: logistic dose-response with brute-force login data.
+
+```elixir
+# Data from Ch 3
+failed_attempts = [1, 3, 5, 10, 20]
+n_accounts =     [200, 150, 80, 40, 15]
+n_brute_force =  [2,   8,  18, 25, 14]
+
+# Log-posterior (flat prior)
+log_posterior = fn a, b ->
+  Enum.zip([failed_attempts, n_accounts, n_brute_force])
+  |> Enum.reduce(0.0, fn {x, n, k}, acc ->
+    logit = a + b * x
+    log_p = if logit >= 0, do: -:math.log(1 + :math.exp(-logit)), else: logit - :math.log(1 + :math.exp(logit))
+    log_1mp = if logit >= 0, do: -logit - :math.log(1 + :math.exp(-logit)), else: -:math.log(1 + :math.exp(logit))
+    acc + k * log_p + (n - k) * log_1mp
+  end)
+end
+```
+
+## Step 1 — Find the Mode (Newton's Method)
+
+```elixir
+# Gradient via finite differences
+eps = 1.0e-5
+
+grad = fn f, a, b ->
+  da = (f.(a + eps, b) - f.(a - eps, b)) / (2 * eps)
+  db = (f.(a, b + eps) - f.(a, b - eps)) / (2 * eps)
+  {da, db}
+end
+
+# Hessian via finite differences
+hessian = fn f, a, b ->
+  f00 = (f.(a + eps, b) - 2 * f.(a, b) + f.(a - eps, b)) / (eps * eps)
+  f11 = (f.(a, b + eps) - 2 * f.(a, b) + f.(a, b - eps)) / (eps * eps)
+  f01 = (f.(a + eps, b + eps) - f.(a + eps, b - eps) - f.(a - eps, b + eps) + f.(a - eps, b - eps)) / (4 * eps * eps)
+  {f00, f01, f01, f11}
+end
+
+# Newton iterations
+{a0, b0} = {-3.0, 0.3}
+
+{a_mode, b_mode} =
+  Enum.reduce(1..20, {a0, b0}, fn _, {a, b} ->
+    {g1, g2} = grad.(log_posterior, a, b)
+    {h11, h12, h21, h22} = hessian.(log_posterior, a, b)
+
+    # Invert 2x2 Hessian
+    det = h11 * h22 - h12 * h21
+    if abs(det) < 1.0e-15 do
+      {a, b}
+    else
+      inv_h11 = h22 / det
+      inv_h12 = -h12 / det
+      inv_h22 = h11 / det
+
+      # Newton step: theta_new = theta - H^{-1} g
+      da = inv_h11 * g1 + inv_h12 * g2
+      db = inv_h12 * g1 + inv_h22 * g2
+      {a - da, b - db}
+    end
+  end)
+
+%{
+  mode_alpha: Float.round(a_mode, 4),
+  mode_beta: Float.round(b_mode, 4),
+  ld50_at_mode: Float.round(-a_mode / b_mode, 1),
+  log_posterior_at_mode: Float.round(log_posterior.(a_mode, b_mode), 2)
+}
+```
+
+## Step 2 — Hessian → Covariance
+
+The Laplace approximation says:
+
+$$
+p(\alpha, \beta \mid y) \approx \text{Normal}\!\left(
+\begin{pmatrix} \hat\alpha \\ \hat\beta \end{pmatrix},\;
+\left(-H\right)^{-1}
+\right)
+$$
+
+where `H` is the Hessian of the log-posterior at the mode.
+
+```elixir
+{h11, h12, _, h22} = hessian.(log_posterior, a_mode, b_mode)
+
+# Negate (we want -H for covariance)
+neg_h11 = -h11
+neg_h12 = -h12
+neg_h22 = -h22
+
+det = neg_h11 * neg_h22 - neg_h12 * neg_h12
+cov_11 = neg_h22 / det
+cov_12 = -neg_h12 / det
+cov_22 = neg_h11 / det
+
+%{
+  sd_alpha: Float.round(:math.sqrt(cov_11), 4),
+  sd_beta: Float.round(:math.sqrt(cov_22), 4),
+  correlation: Float.round(cov_12 / (:math.sqrt(cov_11) * :math.sqrt(cov_22)), 3)
+}
+```
+
+## Step 3 — Sample from the Approximation
+
+```elixir
+n_samples = 3_000
+rng = :rand.seed_s(:exsss, 42)
+
+# Cholesky of 2x2 covariance
+l11 = :math.sqrt(cov_11)
+l21 = cov_12 / l11
+l22 = :math.sqrt(cov_22 - l21 * l21)
+
+{laplace_samples, _} =
+  Enum.reduce(1..n_samples, {[], rng}, fn _, {acc, rng} ->
+    {z1, rng} = :rand.normal_s(rng)
+    {z2, rng} = :rand.normal_s(rng)
+
+    a = a_mode + l11 * z1
+    b = b_mode + l21 * z1 + l22 * z2
+
+    {[%{alpha: a, beta: b} | acc], rng}
+  end)
+
+laplace_samples = Enum.reverse(laplace_samples)
+
+# LD50 from Laplace samples
+ld50_laplace =
+  laplace_samples
+  |> Enum.filter(fn %{beta: b} -> b > 0.01 end)
+  |> Enum.map(fn %{alpha: a, beta: b} -> -a / b end)
+  |> Enum.filter(fn x -> x > 0 and x < 50 end)
+
+ld50_mean = Enum.sum(ld50_laplace) / length(ld50_laplace)
+
+%{
+  ld50_laplace: Float.round(ld50_mean, 1),
+  interpretation: "Laplace: 50% brute-force probability at ~#{Float.round(ld50_mean, 0)} failed attempts"
+}
+```
+
+## Comparing Laplace vs Grid Posterior
+
+How good is the Gaussian approximation?
+
+```elixir
+ld50_data = Enum.map(ld50_laplace, fn x -> %{ld50: x, method: "Laplace"} end)
+
+Vl.new(width: 500, height: 240, title: "LD50 posterior — Laplace approximation")
+|> Vl.data_from_values(ld50_data)
+|> Vl.mark(:bar, color: "#54a24b", opacity: 0.7)
+|> Vl.encode_field(:x, "ld50", type: :quantitative, bin: %{maxbins: 30}, title: "Failed attempts for 50% P(brute force)")
+|> Vl.encode_field(:y, "ld50", type: :quantitative, aggregate: :count)
+```
+
+For this well-behaved logistic model, Laplace and grid agree closely.
+The posterior is unimodal and roughly elliptical — exactly the conditions
+where the Gaussian approximation works. For models with skewness, heavy
+tails, or multiple modes (common in security: bimodal traffic
+distributions, mixture models for insider vs. outsider threats), Laplace
+will mislead. That's when NUTS (Ch 5) earns its keep.
+
+## The Speed Argument
+
+In a production alert-scoring pipeline:
+
+- **Grid (200×200):** ~40,000 density evaluations. Fine for 2D, dead at 5D.
+- **Laplace:** ~20 Newton iterations + 1 Hessian. Milliseconds at any dimension.
+- **NUTS (500 samples):** Seconds to minutes. Best posterior, highest cost.
+
+The real-time scoring system uses Laplace. The nightly recalibration uses
+NUTS. Both are correct for their context.
+
+## What This Tells You
+
+* **Laplace is the posterior on a budget.** Find the mode, measure the
+  curvature, call it Gaussian. Fast. Often good enough.
+* **The approximation works when the posterior is unimodal and symmetric.**
+  The brute-force logistic is ideal. A mixture model is not.
+* **Newton's method finds the mode.** Gradient + Hessian via finite
+  differences — no automatic differentiation needed for 2D. Beyond 5D,
+  use `Nx.Defn.grad`.
+* **Speed matters in operations.** A Laplace that runs in 2ms is more
+  useful at 2 AM than a NUTS run that takes 30 seconds, if the
+  approximation error is small relative to the decision threshold.
+
+## Study Guide
+
+1. **Increase the data** — double all `n_accounts` values. Does the
+   Laplace approximation improve (narrower posterior, closer to grid)?
+
+2. **Add a weakly informative prior** `N(0, 10)` on both α and β. Modify
+   the log-posterior function. Does the mode shift? Does the Hessian
+   change meaningfully?
+
+3. **Compare the Laplace LD50 to the grid LD50** from Ch 3. Compute
+   the difference in means and the overlap of the 90% intervals.
+
+4. **(Hard.)** Implement Laplace in Nx using `Nx.Defn.grad` for the
+   gradient and `Nx.Defn.value_and_grad` for the Hessian (via
+   second-order finite differences on the grad). Time it against the
+   pure-Elixir version.
+
+## Literature
+
+* **Gelman et al.** *BDA3*, §4.1 (normal approximation for bioassay).
+  The direct structural analogue.
+* **Rue, H. & Held, L.** (2005). *Gaussian Markov Random Fields*. INLA
+  (Integrated Nested Laplace Approximation) extends this idea to
+  hierarchical models — the production-grade version of what this
+  notebook does by hand.
+
+### Where to Go Next
+
+* `notebooks/bda/ch04_normal_approximation.livemd` — the same Laplace
+  method on bioassay data.
+* `notebooks/bda-cyber/ch05_eight_socs.livemd` — when Laplace stops
+  scaling (the funnel), NUTS takes over.
