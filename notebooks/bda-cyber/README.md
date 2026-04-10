@@ -1,12 +1,48 @@
 # Bayesian Data Analysis for Cybersecurity
 
+## The Teaching Philosophy
+
+The first probability textbook I owned was full of artillery problems.
+Range estimation, shell dispersion, target acquisition under fog. I loved
+it. But probability theory is not about artillery, and the examples kept
+most people out.
+
+Every field has this problem. The theory is universal — Bayes' theorem
+does not care whether you are estimating a sex ratio, a shell trajectory,
+or an IDS true positive rate. But the learner cares. A nurse learns
+faster from clinical examples. A pilot learns faster from flight
+scenarios. A security analyst learns faster from SOC data. Not because
+the math is different — because the **context is already loaded**. You
+don't spend cognitive effort translating "what is a placenta previa?" or
+"why do I care about windshield hardness?" You recognize the problem
+instantly, and all your attention goes to the new idea.
+
+This is the argument for domain-specific editions of foundational texts.
+The theory belongs to everyone. The examples should belong to the reader.
+
+With language models capable of good technical prose, there is no longer
+an excuse. If you can write a worked example about artillery, you can
+write the same example about alert triage, or crop yields, or insurance
+claims, or satellite orbits. The math doesn't change. The motivation
+does. And motivation is the entire bottleneck in quantitative education.
+
+**This track is a proof of concept.** Every notebook here teaches the
+same Bayesian method as the corresponding chapter in Gelman et al.'s
+*Bayesian Data Analysis* — but on cybersecurity data. A parallel [BDA
+track](../bda/) covers the textbook's original examples. The two tracks
+are interchangeable. Read whichever one makes the theory click faster.
+
+If you work in a different field — manufacturing, finance, medicine,
+logistics — the same approach applies. Take the theory. Replace the
+examples. Publish it. The math will wait for you. The examples should
+meet you where you are.
+
+---
+
 The methods from Gelman et al.'s *Bayesian Data Analysis* applied to
 security operations — IDS alert triage, incident response, vulnerability
 prioritization, and threat modeling. Built in Elixir Livebook using
 [eXMC](https://github.com/borodark/exmc).
-
-A parallel track to the [BDA notebooks](../bda/). Same math. Same framework.
-Different domain.
 
 ## The Argument
 
