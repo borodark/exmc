@@ -521,13 +521,15 @@ defmodule Exmc.NUTS.Tree do
         n_t = Nx.tensor(batch_size, type: :s64)
 
         {all_q, all_p, all_logp, all_grad} =
-          spec_buf.multi_step_fn.(
+          dispatch_multi_step(
+            spec_buf,
             spec_buf.initial_q,
             spec_buf.initial_p,
             spec_buf.initial_grad,
             eps_t,
-            spec_buf.inv_mass_diag,
-            n_t
+            n_t,
+            batch_size,
+            dir_sign
           )
 
         # Copy to BinaryBackend for cheap slicing
@@ -569,13 +571,15 @@ defmodule Exmc.NUTS.Tree do
         n_t = Nx.tensor(to_compute, type: :s64)
 
         {ext_q, ext_p, ext_logp, ext_grad} =
-          spec_buf.multi_step_fn.(
+          dispatch_multi_step(
+            spec_buf,
             dir_buf.last_q,
             dir_buf.last_p,
             dir_buf.last_grad,
             eps_t,
-            spec_buf.inv_mass_diag,
-            n_t
+            n_t,
+            to_compute,
+            dir_sign
           )
 
         ext_q = Nx.backend_copy(ext_q, Nx.BinaryBackend)
@@ -605,6 +609,66 @@ defmodule Exmc.NUTS.Tree do
 
         Map.put(spec_buf, direction, new_dir)
     end
+  end
+
+  # Dispatch K leapfrog steps. The fused Vulkan-chain shader is
+  # selected only when ALL of the following are true (matched in
+  # the function heads below): a `{mu, sigma}` meta is set in app
+  # config (signalling univariate Normal), the active compiler is
+  # Nx.Vulkan, and the model dimension fits the shader's
+  # single-workgroup assumption (d ≤ 256). Otherwise, fall through
+  # to the existing JIT'd `multi_step_fn`. Output contract is
+  # identical in both branches: `{all_q, all_p, all_logp, all_grad}`.
+  defp dispatch_multi_step(spec_buf, q, p, grad, eps_t, n_t, k, dir_sign) do
+    do_dispatch(
+      Application.get_env(:exmc, :fused_leapfrog_normal_meta),
+      Exmc.JIT.detect_compiler(),
+      spec_buf, q, p, grad, eps_t, n_t, k, dir_sign
+    )
+  end
+
+  defp do_dispatch(
+         {mu, sigma},
+         Nx.Vulkan,
+         %{d: d, epsilon: epsilon, inv_mass_diag: inv_mass} = _spec_buf,
+         q, p, _grad, _eps_t, _n_t, k, dir_sign
+       )
+       when is_number(mu) and is_number(sigma) and is_integer(d) and d <= 256 do
+    signed_eps = dir_sign * epsilon
+
+    {:ok, {q_chain, p_chain, grad_chain, logp_chain}} =
+      Nx.Vulkan.leapfrog_chain_normal(
+        vulkan_upload(q),
+        vulkan_upload(p),
+        vulkan_upload(inv_mass),
+        k, signed_eps, mu, sigma
+      )
+
+    {
+      vulkan_to_tensor(q_chain, {k, d}),
+      vulkan_to_tensor(p_chain, {k, d}),
+      vulkan_to_tensor(logp_chain, {k}),
+      vulkan_to_tensor(grad_chain, {k, d})
+    }
+  end
+
+  defp do_dispatch(_meta, _compiler, spec_buf, q, p, grad, eps_t, n_t, _k, _dir_sign) do
+    spec_buf.multi_step_fn.(q, p, grad, eps_t, spec_buf.inv_mass_diag, n_t)
+  end
+
+  defp vulkan_upload(%Nx.Tensor{} = t) do
+    {:ok, ref} = t |> Nx.as_type(:f32) |> Nx.to_binary() |> Nx.Vulkan.upload_binary()
+    ref
+  end
+
+  defp vulkan_to_tensor(ref, shape) do
+    n_elements = shape |> Tuple.to_list() |> Enum.reduce(1, &*/2)
+    {:ok, bin} = Nx.Vulkan.Native.download_binary(ref, n_elements * 4)
+
+    bin
+    |> Nx.from_binary(:f32, backend: Nx.BinaryBackend)
+    |> Nx.reshape(shape)
+    |> Nx.as_type(Exmc.JIT.precision())
   end
 
   # Slice n_steps rows from the direction's buffer at the current cursor.

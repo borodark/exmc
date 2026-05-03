@@ -1,12 +1,53 @@
 Nx.default_backend(Exmc.JIT.backend())
 
 case Exmc.JIT.detect_compiler() do
-  nil -> :ok
-  compiler -> Nx.Defn.default_options(compiler: compiler)
+  nil ->
+    :ok
+
+  Nx.Vulkan ->
+    # Nx.Vulkan.Compiler auto-detects fusable elementwise chains and
+    # dispatches Nx.Vulkan.fused_chain/3 instead of N separate shader
+    # calls. Non-chain bodies fall through to Nx.Defn.Evaluator.
+    Nx.Defn.default_options(compiler: Nx.Vulkan.Compiler)
+
+  compiler ->
+    Nx.Defn.default_options(compiler: compiler)
 end
 
 Application.ensure_all_started(:propcheck)
-ExUnit.start(exclude: [:distributed])
+# Diagnostic suites tagged :diag are excluded by default — they're
+# observational comparisons (e.g., fused-chain variance vs reference)
+# meant to be run on demand via `mix test --include diag`. Same for
+# :slow tests inside diagnostic suites that take many minutes.
+ExUnit.start(exclude: [:diag, :slow])
+
+# Backend-conditional test exclusions.
+#
+# When running under an f32-only backend (Vulkan, EMLX), tests
+# tagged :requires_f64 are skipped. Their precision-tolerance
+# assertions (typically `assert_close` against finite-difference
+# gradients with tol ≤ 1e-2) are tuned for f64 reverse-mode
+# autodiff and reliably fail under f32.
+#
+# When running specifically under :vulkan, tests tagged
+# :vulkan_known_failure are also skipped. These are tracked real
+# bugs (not precision noise) documented in
+# docs/VULKAN_KNOWN_ISSUES.md. Remove the tag once the
+# corresponding issue is fixed.
+# Note: each ExUnit.configure(exclude: ...) call replaces the exclude
+# list. Carry forward the [:diag, :slow] base from ExUnit.start above.
+base_excludes = [:diag, :slow]
+
+case Application.get_env(:exmc, :compiler) do
+  :vulkan ->
+    ExUnit.configure(exclude: base_excludes ++ [:requires_f64, :vulkan_known_failure])
+
+  :emlx ->
+    ExUnit.configure(exclude: base_excludes ++ [:requires_f64, :requires_vulkan])
+
+  _ ->
+    ExUnit.configure(exclude: base_excludes ++ [:requires_vulkan])
+end
 
 # Numeric compare helper for Nx tensors
 

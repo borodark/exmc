@@ -68,6 +68,11 @@ defmodule Exmc.MixProject do
       {:nx, "~> 0.10.0"},
       {:exla, "~> 0.10", optional: true},
       {:emlx, "~> 0.2", optional: true},
+      # Cross-platform GPU compute via Vulkan (FreeBSD + Linux non-CUDA + macOS via MoltenVK).
+      # Path dep during dev workspace iteration; will be `{:nx_vulkan, "~> x.x"}` on hex.
+      {:nx_vulkan,
+       path: System.get_env("NX_VULKAN_PATH", "../../nx_vulkan"),
+       optional: true},
       {:rustler, "~> 0.36", runtime: false},
       {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
