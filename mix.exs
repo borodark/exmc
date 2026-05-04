@@ -69,14 +69,30 @@ defmodule Exmc.MixProject do
       {:exla, "~> 0.10", optional: true},
       {:emlx, "~> 0.2", optional: true},
       # Cross-platform GPU compute via Vulkan (FreeBSD + Linux non-CUDA + macOS via MoltenVK).
-      # Path dep during dev workspace iteration; will be `{:nx_vulkan, "~> x.x"}` on hex.
-      {:nx_vulkan,
-       path: System.get_env("NX_VULKAN_PATH", "../../nx_vulkan"),
-       optional: true},
+      # GitHub source until nx_vulkan reaches hex.pm. Override with
+      # `NX_VULKAN_PATH=/path/to/nx_vulkan mix deps.get` for local iteration.
+      nx_vulkan_dep(),
       {:rustler, "~> 0.36", runtime: false},
       {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:propcheck, "~> 1.4", only: :test, runtime: false}
     ]
   end
+
+  # Default to the GitHub source so a fresh clone of this repo gets a
+  # working nx_vulkan without needing a sibling checkout. Power users
+  # iterating on nx_vulkan locally can override:
+  #
+  #     NX_VULKAN_PATH=/path/to/nx_vulkan mix deps.get
+  #
+  # This will eventually become `{:nx_vulkan, "~> x.x"}` from hex.pm.
+  defp nx_vulkan_dep do
+    nx_vulkan_dep(System.get_env("NX_VULKAN_PATH"))
+  end
+
+  defp nx_vulkan_dep(nil),
+    do: {:nx_vulkan, github: "borodark/nx_vulkan", branch: "main", optional: true}
+
+  defp nx_vulkan_dep(path),
+    do: {:nx_vulkan, path: path, optional: true}
 end

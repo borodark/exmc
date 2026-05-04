@@ -4,8 +4,12 @@
 Mix.install([
   {:exmc, path: Path.expand("../", __DIR__)},
   {:nx, "~> 0.10"},
+  # Match exmc's mix.exs: same source, same branch.
+  # For local nx_vulkan iteration, swap both this AND exmc/mix.exs to
+  # path: deps pointing at your checkout.
   {:nx_vulkan,
-   path: Path.expand("../../../nx_vulkan", __DIR__),
+   github: "borodark/nx_vulkan",
+   branch: "main",
    optional: true},
   {:kino, "~> 0.14"},
   {:kino_vega_lite, "~> 0.1"}
@@ -26,7 +30,7 @@ This notebook does three things:
 2. Samples a trivial Normal-Normal posterior under three backends
    (EXLA reference, Vulkan with the per-step IR walker, Vulkan
    with the fused-leapfrog chain shader) and compares posteriors
-   + wall-clock.
+   * wall-clock.
 3. Visualises the posterior densities side by side.
 
 The Vulkan path uses one fused shader that performs **K=32
@@ -224,17 +228,17 @@ Vl.new(width: 700, height: 360, title: "Posterior of x ~ N(0, 1)")
 
 ## What this notebook does NOT show
 
-- **Phase 2 distributions**: the chain pattern works for Normal
+* **Phase 2 distributions**: the chain pattern works for Normal
   today; Student-t, Cauchy, HalfNormal, Exponential, and an f64
   Normal sibling all have shaders shipped in `nx_vulkan`. eXMC's
   `do_dispatch` only auto-routes Normal as of this notebook's
   date — generalising the dispatch detection per distribution is
   the natural follow-up.
-- **Hierarchical models**: `fused_leapfrog_normal_meta` assumes
+* **Hierarchical models**: `fused_leapfrog_normal_meta` assumes
   scalar `(mu, sigma)`. Hierarchical models with multiple RVs need
   per-IR analysis to identify which RVs are eligible for which
   chain shader.
-- **NUTS-heavy benchmark models**: the Radon, Reliability,
+* **NUTS-heavy benchmark models**: the Radon, Reliability,
   Insurance, etc. notebooks elsewhere in this directory will
   benefit from the fused chain once their distributions get the
   dispatch routing — but they currently fall through to the
@@ -242,13 +246,13 @@ Vl.new(width: 700, height: 360, title: "Posterior of x ~ N(0, 1)")
 
 ## Cross-references
 
-- `~/projects/learn_erl/nx_vulkan/PLAN_FUSED_LEAPFROG.md` — full
+* `~/projects/learn_erl/nx_vulkan/PLAN_FUSED_LEAPFROG.md` — full
   plan and implementation arc
-- `~/projects/learn_erl/nx_vulkan/RESEARCH_FAST_KERNELS.md` —
+* `~/projects/learn_erl/nx_vulkan/RESEARCH_FAST_KERNELS.md` —
   research note on per-dispatch overhead and break-even
-- `docs/VULKAN_KNOWN_ISSUES.md` (in this repo) — tracked
+* `docs/VULKAN_KNOWN_ISSUES.md` (in this repo) — tracked
   Vulkan-specific failures and their status
-- `test/nuts/fused_chain_diag_test.exs` (in this repo) — the
+* `test/nuts/fused_chain_diag_test.exs` (in this repo) — the
   ExUnit test that pins the variance-comparison baseline
-- [The GPU That Doesn't Need CUDA](http://www.dataalienist.com/blog-vulkan-on-freebsd.html)
-- [A Walkable Path Under the Mountain](http://www.dataalienist.com/blog-walkable-path.html)
+* [The GPU That Doesn't Need CUDA](http://www.dataalienist.com/blog-vulkan-on-freebsd.html)
+* [A Walkable Path Under the Mountain](http://www.dataalienist.com/blog-walkable-path.html)
